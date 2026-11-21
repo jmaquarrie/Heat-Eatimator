@@ -136,6 +136,27 @@ def _counter_increments(series, grid, onfrac=None):
     return inc
 
 
+def _dense_increments(series, grid):
+    """Like _counter_increments but linear time, for meters that update every few seconds.
+    The grid must be uniform 30-minute steps starting at grid[0]."""
+    inc = {g: 0.0 for g in grid}
+    if not grid:
+        return inc
+    g0, step, n = grid[0], 1800.0, len(grid)
+    for (t0, v0), (t1, v1) in zip(series, series[1:]):
+        d, secs = v1 - v0, (t1 - t0).total_seconds()
+        if d <= 0 or secs <= 0 or secs > 8 * 3600:
+            continue          # resets (daily counters) and long gaps are skipped
+        a, b = (t0 - g0).total_seconds(), (t1 - g0).total_seconds()
+        i = max(0, int(a // step))
+        while i < n and i * step < b:
+            lo, hi = max(a, i * step), min(b, (i + 1) * step)
+            if hi > lo:
+                inc[grid[i]] += d * (hi - lo) / secs
+            i += 1
+    return inc
+
+
 def fetch_weather(lat, lon, past_days=0, forecast_days=3, tz="Europe/London"):
     """Hourly Open-Meteo data -> list of (naive datetime in tz, {t, rad (kW/m2), wind (m/s), rh})."""
     u = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
@@ -173,6 +194,12 @@ def collect(ha, cfg, days=14):
     onfrac = {g: _fraction(rawstate["heating"], g, g + half, ("on",)) for g in grid} if rawstate["heating"] else None
     heat = _counter_increments(raw["heat_kwh"], grid, onfrac)
     water = _counter_increments(raw["water_kwh"], grid)
+    gridkwh = None
+    if e.get("grid_import_kwh"):
+        try:
+            gridkwh = _dense_increments(_series(ha.history(e["grid_import_kwh"], start.isoformat(), end.isoformat())), grid)
+        except Exception:
+            gridkwh = None
     # weather (past model data + forecast), stored in UTC
     wx = {}
     try:
@@ -189,6 +216,7 @@ def collect(ha, cfg, days=14):
             row[k] = _mean_over(raw[k], g, g2)
         row["heat_kwh"] = heat[g]
         row["water_kwh"] = water[g]
+        row["grid_kwh"] = None if gridkwh is None else round(gridkwh[g], 4)
         row["heating"] = None if onfrac is None else onfrac[g]
         row["home"] = _fraction(rawstate["person"], g, g2, ("home",)) if rawstate["person"] else None
         w = wx.get(g.replace(minute=0))

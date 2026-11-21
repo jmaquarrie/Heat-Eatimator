@@ -64,8 +64,26 @@ class Offline(unittest.TestCase):
         self.assertEqual(data.load_json("plan_latest.json", None)["chosen"], "Your edit")
         planner.publish_sensors(ha, self.cfg, new)
         self.assertTrue(all(p.startswith("/api/states/sensor.heatplanner_") for p, _ in ha.posted))
-        # restore for other tests
+        # undo puts the optimiser's plan back and drops the edit
+        back = planner.restore_plan(ha, self.cfg, data.load_json("plan_latest.json", None))
+        self.assertEqual(back["chosen"], self.plan["chosen"])
+        self.assertNotIn("Your edit", back["strategies"])
+        self.assertEqual([b["data"]["temperature"] for b in ha.helper[back["weekday"]]], [b["temperature"] for b in self.plan["blocks"]])
+        with self.assertRaises(ValueError):
+            planner.restore_plan(ha, self.cfg, back)
         data.save_json("plan_latest.json", self.plan)
+
+    def test_comfort_hours_and_grid_meter(self):
+        for r in self.plan["strategies"].values():
+            self.assertIn("hours_below", r)
+        self.assertIn("current_grid_cost", self.plan["outlook"][0])
+        import datetime as dt
+        g0 = dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)
+        grid = [g0 + dt.timedelta(minutes=30 * i) for i in range(4)]
+        ser = [(g0 + dt.timedelta(minutes=10 * i), 100 + 0.1 * i) for i in range(13)]
+        inc = data._dense_increments(ser, grid)
+        self.assertAlmostEqual(sum(inc.values()), 1.2, places=6)
+        self.assertAlmostEqual(inc[grid[0]], 0.3, places=6)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,9 @@ DEFAULT_CONFIG = {
         "battery_soc": "sensor.marstek_m1_battery_state_of_charge",
         "heating": "binary_sensor.heat_pump_heating",
         "person": "person.arthurs_lane",
+        # Optional grid meter (e.g. Anker Smart Meter Gen 2). Set in config.json -> entities. Leave "" if none.
+        "grid_import_kwh": "",   # energy counter in kWh (daily-resetting or lifetime both work)
+        "grid_power": "",        # live grid power in W (positive = importing), shown on the dashboard
         "climate": "climate.altherma_room_temperature",              # read-only: used to check the pump follows the plan
         "api_budget": "sensor.altherma_gateway_ratelimit_remaining_day",
     },
@@ -200,6 +203,8 @@ def simulate(cfg, params, plan, ctx, use_battery=True, trace=False):
     pen = 0.0
     cost_slot = {"cosy": 0.0, "standard": 0.0, "peak": 0.0}
     tmin = 99.0
+    hours_below = 0.0   # time at home and awake with the room under the soft comfort floor (plain-language comfort)
+    soft_floor = cfg["comfort"]["soft_floor_c"]
     rows = []
     cosy_rate = cfg["tariff"]["rate_cosy"]
     for i in range(steps):
@@ -246,6 +251,8 @@ def simulate(cfg, params, plan, ctx, use_battery=True, trace=False):
         cls = comfort_class(cfg, now.date(), hour)
         pen += comfort_penalty(cfg, cls, t_room, DT)
         tmin = min(tmin, t_room) if cls != "sleep" else tmin
+        if cls == "home" and t_room < soft_floor - 0.1:
+            hours_below += DT
         if trace:
             rows.append({"t": now.strftime("%Y-%m-%dT%H:%M"), "room": round(t_room, 2), "target": tgt,
                          "outdoor": round(to, 1), "q_kw": round(q, 2), "el_kw": round(el, 2),
@@ -258,7 +265,7 @@ def simulate(cfg, params, plan, ctx, use_battery=True, trace=False):
     total = grid_cost - batt_value + terminal + pen
     out = {"grid_cost": grid_cost, "batt_value": batt_value, "terminal": terminal, "penalty": pen,
            "total": total, "kwh_hp": kwh_hp, "kwh_by_slot": kwh_by_slot, "t_end": t_room,
-           "t_min_awake": tmin, "soc_end": soc, "cost_slot": cost_slot}
+           "t_min_awake": tmin, "hours_below": hours_below, "soc_end": soc, "cost_slot": cost_slot}
     if trace:
         out["trace"] = rows
     return out

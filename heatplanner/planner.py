@@ -38,6 +38,7 @@ def _hours(s):
 
 
 DEFAULT_ROUTINE = [18, 20, 18, 20.5, 19, 19, 18]
+SUMMARY_KEYS = ("total", "grid_cost", "penalty", "terminal", "kwh_hp", "kwh_by_slot", "t_min_awake", "t_end", "hours_below")
 
 
 def get_helper(ha, cfg):
@@ -132,15 +133,16 @@ def build_plan(ha, cfg, params, now=None, wx=None):
     results = {}
     for name, vals in strat.items():
         r = model.evaluate(cfg, params, ctx, fixed, vals)
-        results[name] = {"values": vals, **{k: r[k] for k in ("total", "grid_cost", "penalty", "terminal", "kwh_hp", "kwh_by_slot", "t_min_awake", "t_end")}}
+        results[name] = {"values": vals, **{k: r[k] for k in SUMMARY_KEYS}}
     starts = list(strat.values())
     best_vals, best_total = model.optimise(cfg, params, ctx, fixed, starts)
     r = model.evaluate(cfg, params, ctx, fixed, best_vals, trace=True)
-    results["Optimised"] = {"values": best_vals, **{k: r[k] for k in ("total", "grid_cost", "penalty", "terminal", "kwh_hp", "kwh_by_slot", "t_min_awake", "t_end")}}
+    results["Optimised"] = {"values": best_vals, **{k: r[k] for k in SUMMARY_KEYS}}
     nb = model.evaluate(cfg, params, ctx, fixed, best_vals, use_battery=False)
     results["Optimised (no battery, for reference)"] = {"values": best_vals, "total": nb["total"], "grid_cost": nb["grid_cost"],
                                                         "penalty": nb["penalty"], "terminal": nb["terminal"], "kwh_hp": nb["kwh_hp"],
-                                                        "kwh_by_slot": nb["kwh_by_slot"], "t_min_awake": nb["t_min_awake"], "t_end": nb["t_end"]}
+                                                        "kwh_by_slot": nb["kwh_by_slot"], "t_min_awake": nb["t_min_awake"], "t_end": nb["t_end"],
+                                                        "hours_below": nb["hours_below"]}
     cur_trace = model.evaluate(cfg, params, ctx, fixed, current, trace=True)["trace"]
     chosen_name = "Optimised"
     # stability rule: only deviate from the current routine if it saves at least 2p
@@ -188,7 +190,6 @@ def build_plan(ha, cfg, params, now=None, wx=None):
     return plan
 
 
-SUMMARY_KEYS = ("total", "grid_cost", "penalty", "terminal", "kwh_hp", "kwh_by_slot", "t_min_awake", "t_end")
 
 
 def sim_context(cfg, plan):
@@ -244,6 +245,7 @@ def push_values(ha, cfg, plan, values):
     if dt.date.fromisoformat(plan["for_date"]) < dt.datetime.now(LOCAL).date():
         raise ValueError("the latest plan is for %s, which has passed; re-run the model first" % plan["for_date"])
     res = simulate_values(cfg, plan, values)
+    previous = (plan.get("manual") or {}).get("previous") if plan["chosen"] == "Your edit" else plan["chosen"]
     plan = dict(plan)
     plan["blocks"] = res["blocks"]
     plan["blocks_raw"] = [{"from": a, "to": b, "temperature": v} for (a, b), v in zip(cfg["blocks"], res["values"])]
@@ -251,7 +253,26 @@ def push_values(ha, cfg, plan, values):
     plan["strategies"]["Your edit"] = {"values": res["values"], **{k: res[k] for k in SUMMARY_KEYS}}
     plan["chosen"] = "Your edit"
     plan["saving_vs_current_gbp"] = round(plan["strategies"]["Current routine"]["total"] - res["total"], 3)
-    plan["manual"] = {"at": dt.datetime.now(LOCAL).isoformat(timespec="seconds"), "values": res["values"], "trace": res["trace"]}
+    plan["manual"] = {"at": dt.datetime.now(LOCAL).isoformat(timespec="seconds"), "values": res["values"], "trace": res["trace"],
+                      "previous": previous}
+    plan["pushed"] = push(ha, cfg, plan)
+    save_plan(plan)
+    return plan
+
+
+def restore_plan(ha, cfg, plan):
+    """Undo a hand edit: push the strategy the planner had chosen before, and drop the edit."""
+    prev = (plan.get("manual") or {}).get("previous")
+    if plan["chosen"] != "Your edit" or not prev or prev not in plan["strategies"]:
+        raise ValueError("there is no hand edit to undo")
+    plan = dict(plan)
+    vals = plan["strategies"][prev]["values"]
+    plan["blocks"] = [{"from": a, "to": b, "temperature": v} for a, b, v in model.tidy(vals, cfg)]
+    plan["blocks_raw"] = [{"from": a, "to": b, "temperature": v} for (a, b), v in zip(cfg["blocks"], vals)]
+    plan["strategies"] = {k: v for k, v in plan["strategies"].items() if k != "Your edit"}
+    plan["chosen"] = prev
+    plan["saving_vs_current_gbp"] = round(plan["strategies"]["Current routine"]["total"] - plan["strategies"][prev]["total"], 3)
+    plan.pop("manual", None)
     plan["pushed"] = push(ha, cfg, plan)
     save_plan(plan)
     return plan
@@ -306,7 +327,9 @@ def build_outlook(ha, cfg, params, wx, start, chosen_vals):
                         "forecast_mean": round(sum(tm) / len(tm), 1) if tm else None,
                         "blocks": [{"from": a, "to": b, "temperature": v} for a, b, v in model.tidy(vals, cfg)],
                         "grid_cost": round(r["grid_cost"], 2), "penalty": round(r["penalty"], 2), "total": round(r["total"], 2),
-                        "current_total": round(cur["total"], 2), "kwh_hp": round(r["kwh_hp"], 1)})
+                        "current_total": round(cur["total"], 2), "current_grid_cost": round(cur["grid_cost"], 2),
+                        "hours_below": round(r["hours_below"], 2), "current_hours_below": round(cur["hours_below"], 2),
+                        "kwh_hp": round(r["kwh_hp"], 1)})
         except Exception as e:  # forecast may not cover the day
             out.append({"date": day.isoformat(), "error": str(e)})
     return out

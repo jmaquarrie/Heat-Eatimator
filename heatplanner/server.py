@@ -14,10 +14,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import data, planner
+from . import data, model, planner
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-CTYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+CTYPES = {".png": "image/png", ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
           ".svg": "image/svg+xml", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json"}
 # Optional shared key for actions that change things (push, re-run, occupancy). Unset = open, as before.
 WRITE_KEY = os.environ.get("HEATPLANNER_WRITE_KEY", "")
@@ -367,11 +367,12 @@ def live_status():
 
     room, outdoor, soc, rate = (get(e[k]) for k in ("room", "outdoor", "battery_soc", "rate"))
     heating, climate, helper, budget = get(e["heating"]), get(e.get("climate", "")), get(cfg["schedule_entity"]), get(e.get("api_budget", ""))
+    gridp = get(e["grid_power"]) if e.get("grid_power") else None
     if room is None and outdoor is None:
         out["error"] = "Home Assistant did not answer"
         return out
     out.update({"available": True, "room": num(room), "outdoor": num(outdoor), "battery_pct": num(soc), "rate": num(rate),
-                "heating": (heating or {}).get("state"), "api_budget": num(budget)})
+                "heating": (heating or {}).get("state"), "api_budget": num(budget), "grid_w": num(gridp) if gridp else None})
     if climate:
         a = climate.get("attributes", {})
         out["climate"] = {"state": climate.get("state"), "setpoint": a.get("temperature"), "current": a.get("current_temperature")}
@@ -394,21 +395,39 @@ def actuals(date_s):
         t = dt.datetime.fromisoformat(r["ts"]).astimezone(tz)
         if t.date() != d:
             continue
-        h = hours.setdefault(t.hour, {"room": [], "outdoor": [], "target": [], "kwh": 0.0})
+        h = hours.setdefault(t.hour, {"room": [], "outdoor": [], "target": [], "kwh": 0.0, "grid": None})
+        if r.get("grid_kwh") is not None:
+            h["grid"] = (h["grid"] or 0.0) + r["grid_kwh"]
         for k in ("room", "outdoor", "target"):
             if r.get(k) is not None:
                 h[k].append(r[k])
         h["kwh"] += r.get("heat_kwh") or 0.0
     mean = lambda v: round(sum(v) / len(v), 2) if v else None
-    act = [{"h": h, "room": mean(v["room"]), "outdoor": mean(v["outdoor"]), "target": mean(v["target"]), "kwh": round(v["kwh"], 2)}
-           for h, v in sorted(hours.items())]
+    act = [{"h": h, "room": mean(v["room"]), "outdoor": mean(v["outdoor"]), "target": mean(v["target"]), "kwh": round(v["kwh"], 2),
+            "grid_kwh": None if v["grid"] is None else round(v["grid"], 3)} for h, v in sorted(hours.items())]
+    cfg = data.load_config()
+    gh = [r for r in act if r["grid_kwh"] is not None]
+    grid = None
+    if gh:
+        by = {"cosy": 0.0, "standard": 0.0, "peak": 0.0}
+        cost = 0.0
+        for r in gh:
+            rate, slot = model.rate_at(cfg, r["h"])
+            by[slot] += r["grid_kwh"]
+            cost += r["grid_kwh"] * rate
+        grid = {"kwh": round(sum(by.values()), 2), "kwh_by_slot": {k: round(v, 2) for k, v in by.items()},
+                "cost": round(cost, 2), "hours": len(gh)}
     plan = data.load_json("plan_%s.json" % d.isoformat(), None)
     pred, strat = None, None
     if plan and plan.get("compare"):
         strat = plan["chosen"] if plan["chosen"] in plan["compare"] else "Optimised"
         c = plan["compare"][strat]
         pred = [{"h": int(t[11:13]), "room": room, "kwh": el} for t, room, el in zip(c["t"], c["room"], c["el"]) if t[:10] == d.isoformat()]
-    return {"date": d.isoformat(), "actual": act, "predicted": pred, "strategy": strat}
+    pred_grid = None
+    if plan and plan.get("strategies", {}).get(plan.get("chosen")):
+        pred_grid = round(plan["strategies"][plan["chosen"]]["grid_cost"], 2)
+    return {"date": d.isoformat(), "actual": act, "predicted": pred, "strategy": strat, "grid": grid,
+            "predicted_window_grid_cost": pred_grid}
 
 
 def public_config():
@@ -441,6 +460,25 @@ def do_simulate(body):
         return 200, json.dumps(planner.simulate_values(data.load_config(), plan, body.get("values"))), "application/json"
     except ValueError as e:
         return 400, json.dumps({"error": str(e)}), "application/json"
+
+
+def do_restore(body):
+    plan = data.load_json("plan_latest.json", None)
+    if not plan:
+        return 404, json.dumps({"error": "no plan yet"}), "application/json"
+    try:
+        new = planner.restore_plan(_ha(), data.load_config(), plan)
+    except ValueError as e:
+        return 400, json.dumps({"error": str(e)}), "application/json"
+    STATUS_CACHE["at"] = 0
+    try:
+        planner.publish_sensors(_ha(), data.load_config(), new)
+    except Exception:
+        pass
+    with open(data.path("log.jsonl"), "a") as f:
+        f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "event": "manual_undo",
+                            "for_date": new["for_date"], "restored": new["chosen"], "verified": new["pushed"]["verified"]}) + "\n")
+    return 200, json.dumps({"pushed": new["pushed"], "blocks": new["blocks"], "chosen": new["chosen"]}), "application/json"
 
 
 def do_push(body):
@@ -493,6 +531,8 @@ class H(BaseHTTPRequestHandler):
                 return self.static("index.html")
             if p.startswith("/static/"):
                 return self.static(p[len("/static/"):])
+            if p in ("/sw.js", "/manifest.webmanifest"):   # served from the root so the worker can control "/"
+                return self.static(p[1:])
             if p == "/classic":
                 return self.send(200, page(), "text/html; charset=utf-8")
             if p == "/api/status":
@@ -527,6 +567,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send(403, json.dumps({"error": "write key required", "need_key": True}), "application/json")
             if p == "/api/push":
                 return self.send(*do_push(body))
+            if p == "/api/restore":
+                return self.send(*do_restore(body))
             if p == "/api/occupancy":
                 return self.send(*save_occupancy(body))
             if p == "/api/rerun":

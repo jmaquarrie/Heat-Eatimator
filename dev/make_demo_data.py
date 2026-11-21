@@ -105,7 +105,8 @@ def main(out):
         for half in (0, 30):
             ts = (lt + dt.timedelta(minutes=half)).astimezone(dt.timezone.utc)
             rows[ts.isoformat()] = {"ts": ts.isoformat(), "room": round(room + random.uniform(-0.35, 0.45) + 0.2, 2),
-                                    "outdoor": 4.0, "target": 19.0, "heat_kwh": round(max(0, el / 2 * random.uniform(0.7, 1.4)), 2)}
+                                    "outdoor": 4.0, "target": 19.0, "heat_kwh": round(max(0, el / 2 * random.uniform(0.7, 1.4)), 2),
+                                        "grid_kwh": round((el / 2 + 0.125) * (2.4 if lt.hour in (4, 5, 6, 13, 14, 15, 22, 23) else 0.3), 3)}
     data.save_json("obs.json", {"rows": rows})
 
     bt = []

@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editRes: null, actuals: null };
+const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editRes: null, actuals: null, occ: null };
 const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const WDL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -19,6 +19,8 @@ const COLOR = {
   "Cosy windows only (floors off-peak)": "var(--s4)", "Current routine": "var(--muted)",
 };
 const ORDER = ["Optimised", "Current routine", "Steady comfort temp (battery covers gaps)", "Cosy windows only (floors off-peak)", "Your edit"];
+const TABS = ["now", "plan", "week", "home", "more"];
+const MOBILE = () => matchMedia("(max-width: 759px)").matches;
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const gbp = (v) => (v < 0 ? "−£" : "£") + Math.abs(v).toFixed(2);
@@ -31,6 +33,8 @@ const wdIdx = (d) => (d.getDay() + 6) % 7;
 const fmtDate = (d) => WD[wdIdx(d)] + " " + d.getDate() + " " + MON[d.getMonth()];
 const isoDate = (d) => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const nowH = () => { const n = new Date(); return n.getHours() + n.getMinutes() / 60; };
+const tile = (k, v, d) => '<div class="tile"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="d">' + (d || "") + "</div></div>";
 
 function tariff(h) {
   const t = S.cfg.tariff, x = ((h % 24) + 24) % 24;
@@ -40,8 +44,23 @@ function tariff(h) {
 }
 const pence = (r) => Math.round(r * 1000) / 10 + "p";
 
+/** Plain-language comfort: hours below the soft floor while home and awake. */
+function comfortText(r, short) {
+  const f = deg(S.cfg.comfort.soft_floor_c);
+  if (r.hours_below == null) return r.penalty < 0.05 ? "Warm enough" : "Some time below " + f;
+  if (r.hours_below < 0.25) return short ? "Warm enough" : "Warm enough all day";
+  const h = r.hours_below < 1 ? Math.round(r.hours_below * 60) + " min" : (Math.round(r.hours_below * 2) / 2) + " h";
+  return h + " below " + f + (short ? "" : " while home");
+}
+function moneyDelta(a, b, unit) {
+  const d = a - b;
+  if (Math.abs(d) < 0.005) return '<span class="d">same as routine</span>';
+  return '<span class="d ' + (d < 0 ? "up-good" : "up-bad") + '">' + (d < 0 ? "▼ " : "▲ ") + (unit ? Math.abs(d).toFixed(1) + " " + unit : gbp(Math.abs(d))) + (d < 0 ? " less" : " more") + " than routine</span>";
+}
+
 /* ---------------------------------------------------------------- API */
 function key() { try { return localStorage.getItem("hp-key") || ""; } catch (e) { return ""; } }
+let servedFromCache = null;
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-Planner-Key": key() }, body: JSON.stringify(body) };
   let r = await fetch(path, opt);
@@ -52,6 +71,7 @@ async function api(path, body) {
     opt.headers["X-Planner-Key"] = k;
     r = await fetch(path, opt);
   }
+  if (path === "/api/plan" && r.headers.get("X-From-Cache")) servedFromCache = r.headers.get("X-From-Cache");
   const txt = await r.text();
   let j; try { j = JSON.parse(txt); } catch (e) { j = { error: txt }; }
   if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
@@ -59,17 +79,20 @@ async function api(path, body) {
 }
 
 async function loadAll() {
+  servedFromCache = null;
   const [plan, params, idx, cfg, log] = await Promise.all(["/api/plan", "/api/params", "/api/plans", "/api/config", "/api/log"].map((p) => api(p).catch(() => null)));
   S.plan = plan && plan.for_date ? plan : null; S.params = params || {}; S.idx = idx || []; S.cfg = cfg; S.log = log || [];
-  S.edit = null; S.editRes = null;
-  if (S.plan && S.plan.manual && S.plan.chosen === "Your edit") S.editRes = null;
+  S.edit = null; S.editRes = null; S.occ = null;
+  const off = $("#offline");
+  off.hidden = !servedFromCache;
+  if (servedFromCache) off.textContent = "Offline: showing the plan saved on this device. Live readings and editing come back when the planner is reachable.";
   render();
   loadStatus();
-  api("/api/actuals").then((a) => { S.actuals = a; renderActuals(); }).catch(() => {});
+  api("/api/actuals").then((a) => { S.actuals = a; renderActuals(); renderMeter(); }).catch(() => { renderMeter(); });
 }
 async function loadStatus() {
   try { S.status = await api("/api/status"); } catch (e) { S.status = { available: false, error: String(e.message) }; }
-  renderChips();
+  renderChips(); renderNow();
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -77,7 +100,8 @@ function planValues() { return S.plan.blocks_raw.map((b) => b.temperature); }
 function routineValues() { return S.plan.strategies["Current routine"].values; }
 function sameVals(a, b) { return a && b && a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < 1e-9); }
 function editing() { return S.edit && S.editRes && !sameVals(S.edit, planValues()); }
-function chosenName() { return S.plan.chosen; }
+function chosenLabel() { return NAMES[S.plan.chosen] || S.plan.chosen; }
+function isDark() { const t = document.documentElement.dataset.theme; return t ? t === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; }
 
 function seqColor(v) {
   // sequential one-hue ramp for setpoints 16..22
@@ -86,9 +110,7 @@ function seqColor(v) {
   const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
   const a = p(lo), b = p(hi);
   const c = a.map((x, i) => Math.round(x + (b[i] - x) * t));
-  const dark = document.documentElement.dataset.theme === "dark" || (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
-  const lite = dark ? t > 0.55 : t < 0.45;
-  return { bg: "rgb(" + c.join(",") + ")", lite };
+  return { bg: "rgb(" + c.join(",") + ")", lite: isDark() ? t > 0.55 : t < 0.45 };
 }
 function strip(blocks, labels = true) {
   return '<div class="strip" role="img" aria-label="' + esc(blocks.map((b) => rng(b.from, b.to) + " " + b.temperature + "°").join(", ")) + '">' +
@@ -99,6 +121,18 @@ function tidy(values) {
   S.cfg.blocks.forEach(([a, b], i) => { const v = values[i]; if (out.length && out[out.length - 1].temperature === v) out[out.length - 1].to = b; else out.push({ from: a, to: b, temperature: v }); });
   return out;
 }
+function mergeBlocks(bs) {
+  const out = [];
+  bs.forEach((b) => { if (out.length && out[out.length - 1].temperature === b.temperature) out[out.length - 1].to = b.to; else out.push({ ...b }); });
+  return out;
+}
+/** Today's setpoint blocks: from the plan if it is for today, else from the stored "today" part of tonight's plan. */
+function todayBlocks() {
+  const p = S.plan, today = isoDate(new Date());
+  if (p.for_date === today) return p.blocks;
+  if (p.sim && p.sim.start.slice(0, 10) === today) return mergeBlocks(p.sim.fixed.map(([a, b, t]) => ({ from: a, to: b, temperature: t })));
+  return null;
+}
 
 /** Plain-English reasons a strategy differs from the routine. */
 function explain(vals, base) {
@@ -106,13 +140,28 @@ function explain(vals, base) {
   S.cfg.blocks.forEach(([a, b], i) => {
     const d = vals[i] - base[i];
     if (Math.abs(d) < 0.25) return;
-    const t = tariff(a);
-    const r = rng(a, b);
-    const w = vals[i] + "° instead of " + base[i] + "° " + r;
-    if (d > 0) parts.push((t.slot === "cosy" ? "pre-heats to " + w + " while power is cheap" : "runs warmer at " + w));
-    else parts.push((t.slot === "peak" ? "eases off to " + w + " through the peak" : "runs cooler at " + w));
+    const t = tariff(a), r = rng(a, b), w = vals[i] + "° instead of " + base[i] + "° " + r;
+    if (d > 0) parts.push(t.slot === "cosy" ? "pre-heats to " + w + " while power is cheap" : "runs warmer at " + w);
+    else parts.push(t.slot === "peak" ? "eases off to " + w + " through the peak" : "runs cooler at " + w);
   });
   return parts;
+}
+const joinAnd = (a) => (a.length > 1 ? a.slice(0, -1).join(", ") + " and " + a[a.length - 1] : a[0] || "");
+
+/* ---------------------------------------------------------------- tabs (phones) */
+function setTab(t, scroll = true) {
+  if (!TABS.includes(t)) t = "now";
+  document.body.dataset.tab = t;
+  document.querySelectorAll(".sec").forEach((s) => s.classList.toggle("tab-off", s.dataset.tab !== t));
+  document.querySelectorAll(".tabbar button").forEach((b) => b.setAttribute("aria-current", b.dataset.go === t ? "page" : "false"));
+  if (scroll && MOBILE()) scrollTo(0, 0);
+  if (S.plan) requestAnimationFrame(drawCharts);
+}
+function tabForHash(h) {
+  const id = (h || "").replace("#", "");
+  if (TABS.includes(id)) return id;
+  const sec = id && document.getElementById(id);
+  return sec && sec.dataset.tab ? sec.dataset.tab : null;
 }
 
 /* ---------------------------------------------------------------- render: all */
@@ -120,8 +169,14 @@ function render() {
   $("#loading").hidden = !!S.plan;
   if (!S.plan) { $("#loading").textContent = "No plan yet. The first one is made at 22:00, or run “heatplanner.cli plan”."; return; }
   document.querySelectorAll(".sec").forEach((s) => (s.hidden = false));
-  renderHero(); renderTimeline(); renderEditor(); renderStrategies(); renderWeek(); renderOcc(); renderModel(); renderHistory(); renderChips();
+  setTab(document.body.dataset.tab, false);
+  renderNow(); renderHero(); renderEditor(); renderStrategies(); renderWeek(); renderOcc(); renderModel(); renderHistory(); renderChips();
+  drawCharts();
   $("#foot-entity").textContent = S.cfg.schedule_entity;
+}
+function drawCharts() {
+  if (!S.plan) return;
+  renderTimeline(); renderBreakdown(); renderBacktest((S.params || {}).backtest || []); renderActuals();
 }
 
 /* ---------------------------------------------------------------- chips */
@@ -137,16 +192,50 @@ function renderChips() {
   else if (!st.available) out.push(chip("warn", "Live data unavailable", st.error));
   else {
     if (st.following === true) out.push(chip("good", "Heat pump <b>following plan</b>", "Thermostat setpoint matches the planner helper"));
-    else if (st.following === false) out.push(chip("warn", "Heat pump at <b>" + deg(st.climate.setpoint) + "</b>, plan says <b>" + deg(st.helper.temperature) + "</b>", "Expected until the HA automation linking the helper to the thermostat is in place"));
+    else if (st.following === false) out.push(chip("warn", "Pump at <b>" + deg(st.climate.setpoint) + "</b>, plan <b>" + deg(st.helper.temperature) + "</b>", "Expected until the HA automation linking the helper to the thermostat is in place"));
     else out.push(chip("", "Pump link: not set up yet"));
     if (st.api_budget != null) out.push(chip(st.api_budget < 15 ? "warn" : "", "Daikin API left <b>" + Math.round(st.api_budget) + "</b>", "Daikin cloud calls left today (about 200 a day)"));
-    if (st.room != null) out.push(chip("", "Room <b>" + deg(st.room) + "</b>"));
-    if (st.outdoor != null) out.push(chip("", "Outside <b>" + deg(st.outdoor) + "</b>"));
-    if (st.battery_pct != null) out.push(chip("", "Battery <b>" + Math.round(st.battery_pct) + "%</b>"));
-    if (st.rate != null) { const t = st.rate < 0.2 ? "Cosy" : st.rate > 0.35 ? "Peak" : "Standard"; out.push(chip(t === "Peak" ? "crit" : t === "Cosy" ? "good" : "", t + " <b>" + pence(st.rate) + "</b>")); }
-    if (st.heating) out.push(chip(st.heating === "on" ? "good" : "", "Heating <b>" + esc(st.heating) + "</b>"));
+    if (st.grid_w != null) out.push(chip("", (st.grid_w >= 0 ? "Grid importing <b>" : "Grid exporting <b>") + (Math.abs(st.grid_w) / 1000).toFixed(2) + " kW</b>"));
   }
   $("#chips").innerHTML = out.join("");
+}
+
+/* ---------------------------------------------------------------- now card */
+function renderNow() {
+  if (!S.plan || !S.cfg) return;
+  const st = S.status || {}, h = nowH(), p = S.plan;
+  const tb = todayBlocks();
+  let curB = null, nextB = null, nextWhen = "";
+  if (tb) {
+    const i = tb.findIndex((b) => b.from <= h && h < b.to);
+    curB = tb[i] || null;
+    nextB = i >= 0 ? tb[i + 1] || null : null;
+    if (nextB) nextWhen = hh(nextB.from);
+    else if (p.for_date !== isoDate(new Date()) && p.blocks.length) { nextB = p.blocks[0]; nextWhen = "00:00"; }
+  }
+  const target = st.helper && st.helper.temperature != null ? st.helper.temperature : curB ? curB.temperature : null;
+  let pred = null;
+  const now = new Date();
+  for (const r of p.trace_best || []) { if (parseT(r.t) <= now) pred = r.room; else break; }
+  const tf = tariff(h);
+  let nh = Math.floor(h * 2) / 2 + 0.5, guard = 0;
+  while (tariff(nh).slot === tf.slot && guard++ < 48) nh += 0.5;
+  const nt = tariff(nh);
+  const room = st.room;
+  const diff = room != null && pred != null ? room - pred : null;
+  const facts = [];
+  facts.push('<div class="fact"><span>Tariff now</span><b><span class="tag ' + tf.slot + '">' + tf.label + " " + pence(tf.rate) + "</span></b><small>" + nt.label + " from " + hh(nh % 24) + "</small></div>");
+  if (st.battery_pct != null) facts.push('<div class="fact"><span>Battery</span><b>' + Math.round(st.battery_pct) + "%</b><small>" + (S.cfg.battery.capacity_kwh * st.battery_pct / 100).toFixed(1) + " kWh</small></div>");
+  if (st.outdoor != null) facts.push('<div class="fact"><span>Outside</span><b>' + deg(st.outdoor) + "</b><small>" + deg(p.forecast_tomorrow.min, 0) + " to " + deg(p.forecast_tomorrow.max, 0) + " on plan day</small></div>");
+  if (st.heating) facts.push('<div class="fact"><span>Heating</span><b>' + (st.heating === "on" ? "Running" : "Idle") + "</b><small>" + (st.following === true ? "following plan" : st.following === false ? "not following plan" : "pump link not set") + "</small></div>");
+  let strip24 = "";
+  if (tb) strip24 = '<div class="today"><div class="mini-title">Today\'s setpoints</div><div class="today-strip">' + strip(tb) + '<i class="now-mark" style="left:' + (h / 24 * 100).toFixed(2) + '%"></i></div><div class="today-ax"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div></div>';
+  $("#now-card").innerHTML =
+    '<div class="now-main"><div class="now-room"><span class="k">Room now</span><span class="big">' + (room != null ? deg(room) : "–") + "</span>" +
+    '<span class="d">' + (target != null ? "target " + deg(target) : "") + (diff != null ? ' · <span class="' + (Math.abs(diff) > 1 ? "up-bad" : "") + '">' + (Math.abs(diff) < 0.15 ? "as predicted" : Math.abs(diff).toFixed(1) + "° " + (diff > 0 ? "warmer" : "cooler") + " than predicted") + "</span>" : "") + "</span></div>" +
+    '<div class="now-next"><span class="k">Next change</span>' + (nextB ? '<span class="nx"><b>' + nextWhen + "</b> → <b>" + deg(nextB.temperature) + '</b></span><span class="tag ' + tariff(nextB.from).slot + '">' + tariff(nextB.from).label + "</span>" : '<span class="nx">None today</span>') + "</div></div>" +
+    strip24 + '<div class="facts">' + facts.join("") + "</div>" +
+    (st.available === false ? '<p class="foot">Live readings unavailable: ' + esc(st.error || "") + "</p>" : "");
 }
 
 /* ---------------------------------------------------------------- hero */
@@ -157,48 +246,48 @@ function renderHero() {
   const when = rel === 0 ? "Today" : rel === 1 ? "Tomorrow" : rel === -1 ? "Yesterday" : WDL[wdIdx(d)];
   const ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
   const fc = p.forecast_tomorrow;
-  $("#hero-eyebrow").innerHTML = "<span>" + when + " · " + fmtDate(d) + "</span>" + '<span class="tag">' + deg(fc.min, 0) + " to " + deg(fc.max, 0) + " outside</span>" +
+  $("#hero-eyebrow").innerHTML = "<span>" + when + "'s plan · " + fmtDate(d) + "</span>" + '<span class="tag">' + deg(fc.min, 0) + " to " + deg(fc.max, 0) + " outside</span>" +
     '<span class="tag">' + ({ home: "Home all day", away_day: "Out " + rng(S.cfg.occupancy.away_from, S.cfg.occupancy.away_to), away_all: "Away all day" }[p.occupancy?.status_tomorrow] || "") + "</span>";
-  const saving = p.saving_vs_current_gbp;
-  let title, why;
+  let title, why = "";
+  const money = cur.grid_cost - ch.grid_cost, comfort = cur.penalty - ch.penalty;
   if (p.chosen === "Current routine") { title = "Your routine is already the best plan"; why = "Nothing beat it by more than 2p, so the planner kept your usual setpoints."; }
-  else if (p.chosen === "Your edit") { title = "Running your edited plan"; why = "Pushed by hand at " + esc((p.manual?.at || "").slice(11, 16)) + ". Tonight's 22:00 run plans the next day as normal."; }
+  else if (p.chosen === "Your edit") { title = "Running your edited plan"; why = "Pushed by hand at " + esc((p.manual?.at || "").slice(11, 16)) + ". " + (money >= 0.01 ? "About " + gbp(money) + " less electricity than your routine. " : money <= -0.01 ? "About " + gbp(-money) + " more electricity than your routine. " : "") + "Tonight's 22:00 run plans the next day as normal."; }
   else {
-    const money = cur.grid_cost - ch.grid_cost, comfort = cur.penalty - ch.penalty;
     if (money >= 0.01) title = "Saves about " + gbp(money) + " on electricity" + (comfort > 0.05 ? " and keeps you warmer" : "");
     else if (comfort > 0.05) title = "Keeps you warmer than your routine for " + gbp(-money) + " more";
-    else title = "Scores " + gbp(saving) + " better than your routine";
+    else title = "A slightly better day than your routine";
     const ex = explain(ch.values, cur.values);
-    why = ex.length ? "It " + (ex.length > 1 ? ex.slice(0, Math.min(3, ex.length) - 1).join(", ") + " and " + ex[Math.min(3, ex.length) - 1] : ex[0]) + "." : "";
-    if (comfort > 0.05) why += " Your routine would let the room fall below the comfort floor while you're home (priced at " + gbp(cur.penalty) + ").";
+    why = ex.length ? "It " + joinAnd(ex.slice(0, 3)) + "." : "";
+    if (comfort > 0.05 && cur.hours_below != null) why += " Your routine would leave the room " + comfortText(cur) + ".";
+    else if (comfort > 0.05) why += " Your routine would let the room fall below the comfort floor while you're home.";
   }
   $("#hero-title").textContent = title;
   $("#hero-why").innerHTML = why;
-  const tiles = [
-    ["Electricity cost", gbp(ch.grid_cost), "Routine " + gbp(cur.grid_cost) + " · incl. house load"],
-    ["Pump electricity", ch.kwh_hp.toFixed(1) + " kWh", "Routine " + cur.kwh_hp.toFixed(1) + " kWh"],
-    ["Coldest while awake", deg(ch.t_min_awake), "Comfort floor " + deg(S.cfg.comfort.soft_floor_c)],
-    ["Comfort shortfall", gbp(ch.penalty), ch.penalty < 0.05 ? "Floors held" : "Priced time below the floors"],
-  ];
-  $("#hero-tiles").innerHTML = tiles.map(([k, v, d]) => '<div class="tile"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="d">' + d + "</div></div>").join("");
+  $("#hero-tiles").innerHTML = [
+    tile("Electricity", gbp(ch.grid_cost), "Routine " + gbp(cur.grid_cost) + " · incl. house"),
+    tile("Pump electricity", ch.kwh_hp.toFixed(1) + " kWh", "Routine " + cur.kwh_hp.toFixed(1) + " kWh"),
+    tile("Coldest while awake", deg(ch.t_min_awake), "Comfort floor " + deg(S.cfg.comfort.soft_floor_c)),
+    tile("Comfort", comfortText(ch, true), "Routine: " + comfortText(cur, true).toLowerCase()),
+  ].join("");
 }
 
 /* ---------------------------------------------------------------- timeline (small multiples, shared x) */
 function renderTimeline() {
   const box = $("#timeline");
   const p = S.plan, rows = p.trace_best || [];
+  if (!box.offsetParent) return; // hidden tab: drawn when shown
   if (!rows.length) { box.innerHTML = '<p class="foot">No trace stored with this plan.</p>'; return; }
   const cur = p.trace_current || [];
   const ed = editing() ? S.editRes.trace : null;
   const n = rows.length;
-  const W = Math.max(320, box.clientWidth || 900);
+  const W = Math.max(300, box.clientWidth || 900);
   const narrow = W < 600;
-  const L = narrow ? 34 : 42, R = narrow ? 50 : 64;
+  const L = narrow ? 30 : 42, R = narrow ? 44 : 64;
   const lanes = [
-    { id: "room", title: "Room °C", h: narrow ? 190 : 250 },
-    { id: "out", title: "Outside °C", h: 58 },
-    { id: "el", title: "Pump kWh per hour", h: 70 },
-    { id: "soc", title: "Battery kWh", h: 56 },
+    { id: "room", title: "Room °C", h: narrow ? 210 : 260 },
+    { id: "out", title: "Outside °C", h: 54 },
+    { id: "el", title: "Pump kWh per hour", h: 66 },
+    { id: "soc", title: "Battery kWh", h: 52 },
   ];
   const RIB = 20, GAP = 22, XA = 22;
   let y = RIB + 6;
@@ -208,26 +297,22 @@ function renderTimeline() {
   const o = [];
   o.push('<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="Predicted room temperature, outside temperature, pump electricity and battery through the plan window">');
 
-  // tariff washes across all lanes + ribbon labels
   let segStart = 0;
   for (let i = 1; i <= n; i++) {
     const prev = tariff(parseT(rows[i - 1].t).getHours());
     const nxt = i < n ? tariff(parseT(rows[i].t).getHours()) : null;
     if (!nxt || nxt.slot !== prev.slot) {
       const x0 = x(segStart), x1 = x(i);
-      if (prev.slot !== "standard") o.push('<rect x="' + x0 + '" y="' + 0 + '" width="' + (x1 - x0) + '" height="' + (H - XA) + '" fill="var(--' + prev.slot + ')"/>');
-      if (x1 - x0 > 34) o.push('<text x="' + (x0 + 6) + '" y="14" class="ax" style="fill:' + (prev.slot === "standard" ? "var(--muted)" : "var(--" + prev.slot + "-ink)") + ';font-weight:600">' + prev.label + (x1 - x0 > 70 ? " " + pence(prev.rate) : "") + "</text>");
+      if (prev.slot !== "standard") o.push('<rect x="' + x0 + '" y="0" width="' + (x1 - x0) + '" height="' + (H - XA) + '" fill="var(--' + prev.slot + ')"/>');
+      if (x1 - x0 > 30 && !(narrow && prev.slot === "standard")) o.push('<text x="' + (x0 + 5) + '" y="14" class="ax" style="fill:' + (prev.slot === "standard" ? "var(--muted)" : "var(--" + prev.slot + "-ink)") + ';font-weight:600">' + (x1 - x0 > 52 ? prev.label : prev.label.slice(0, 3)) + (x1 - x0 > 76 ? " " + pence(prev.rate) : "") + "</text>");
       segStart = i;
     }
   }
-
-  // "now" marker
   const t0 = parseT(rows[0].t), tN = new Date(t0.getTime() + n * 9e5), now = new Date();
   if (now > t0 && now < tN) {
-    const xn = x(((now - t0) / 9e5));
+    const xn = x((now - t0) / 9e5);
     o.push('<line x1="' + xn + '" x2="' + xn + '" y1="' + RIB + '" y2="' + (H - XA) + '" stroke="var(--ink)" stroke-width="1" stroke-dasharray="2 3" opacity=".5"/><text x="' + (xn + 4) + '" y="' + (RIB + 12) + '" class="ax" style="fill:var(--ink)">now</text>');
   }
-
   const laneScale = (ln, lo, hi) => (v) => ln.y0 + ln.h * (1 - (v - lo) / (hi - lo));
   const gridY = (ln, lo, hi, step, fmt) => {
     const Y = laneScale(ln, lo, hi);
@@ -238,39 +323,36 @@ function renderTimeline() {
   const path = (vals, X, Y) => vals.map((v, i) => (i ? "L" : "M") + X(i).toFixed(1) + "," + Y(v).toFixed(1)).join("");
   const stepPath = (vals, Y) => vals.map((v, i) => (i ? "L" + x(i).toFixed(1) + "," + Y(v).toFixed(1) : "M" + x(0) + "," + Y(v).toFixed(1)) + "L" + x(i + 1).toFixed(1) + "," + Y(v).toFixed(1)).join("");
 
-  // ---- room lane
+  // ---- room lane (domain always covers the setpoint range so handles can reach it)
   const c = S.cfg.comfort;
   const floorOf = (cls) => (cls === "sleep" ? c.sleep_floor_c : cls === "away" ? c.away_floor_c : c.soft_floor_c);
   const roomPts = (tr) => [p.t_room0].concat(tr.map((r) => r.room));
   const plan = roomPts(rows), rout = cur.length ? roomPts(cur) : null, edt = ed ? roomPts(ed) : null;
-  const allR = plan.concat(rout || [], edt || [], rows.map((r) => r.target), rows.map((r) => floorOf(r.cls)), (ed || []).map((r) => r.target));
+  const allR = plan.concat(rout || [], edt || [], [c.min_setpoint_c, c.max_setpoint_c]);
   const rlo = Math.floor(Math.min(...allR) - 0.3), rhi = Math.ceil(Math.max(...allR) + 0.3);
   const RL = lanes[0];
   const Yr = gridY(RL, rlo, rhi, rhi - rlo > 6 ? 2 : 1, (v) => v + "°");
-  // below-floor wash
-  o.push('<path d="' + rows.map((r, i) => (i ? "L" : "M") + x(i) + "," + Yr(floorOf(r.cls)) + "L" + x(i + 1) + "," + Yr(floorOf(r.cls))).join("") + "L" + x(n) + "," + (RL.y0 + RL.h) + "L" + x(0) + "," + (RL.y0 + RL.h) + 'Z" fill="var(--below)"/>');
-  o.push('<path d="' + rows.map((r, i) => (i ? "L" : "M") + x(i) + "," + Yr(floorOf(r.cls)) + "L" + x(i + 1) + "," + Yr(floorOf(r.cls))).join("") + '" fill="none" stroke="var(--muted)" stroke-width="1"/>');
-  const Xr = (i) => x(i);
+  const floorPath = rows.map((r, i) => (i ? "L" : "M") + x(i) + "," + Yr(floorOf(r.cls)) + "L" + x(i + 1) + "," + Yr(floorOf(r.cls))).join("");
+  o.push('<path d="' + floorPath + "L" + x(n) + "," + (RL.y0 + RL.h) + "L" + x(0) + "," + (RL.y0 + RL.h) + 'Z" fill="var(--below)"/>');
+  o.push('<path d="' + floorPath + '" fill="none" stroke="var(--muted)" stroke-width="1"/>');
   o.push('<path d="' + stepPath(rows.map((r) => r.target), Yr) + '" fill="none" stroke="var(--ink-2)" stroke-width="1.5" stroke-dasharray="5 4"/>');
   if (ed) o.push('<path d="' + stepPath(ed.map((r) => r.target), Yr) + '" fill="none" stroke="var(--edit)" stroke-width="1.5" stroke-dasharray="5 4" opacity=".8"/>');
-  if (rout) o.push('<path d="' + path(rout, Xr, Yr) + '" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="2 3"/>');
-  o.push('<path d="' + path(plan, Xr, Yr) + '" fill="none" stroke="var(--plan)" stroke-width="2.25" stroke-linejoin="round"/>');
-  if (edt) o.push('<path d="' + path(edt, Xr, Yr) + '" fill="none" stroke="var(--edit)" stroke-width="2.25" stroke-linejoin="round"/>');
-  // direct labels at the right end, nudged apart
+  if (rout) o.push('<path d="' + path(rout, x, Yr) + '" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="2 3"/>');
+  o.push('<path d="' + path(plan, x, Yr) + '" fill="none" stroke="var(--plan)" stroke-width="2.25" stroke-linejoin="round"/>');
+  if (edt) o.push('<path d="' + path(edt, x, Yr) + '" fill="none" stroke="var(--edit)" stroke-width="2.25" stroke-linejoin="round"/>');
   const dls = [{ t: "Plan", v: plan[n], col: "var(--plan)" }];
   if (rout && p.chosen !== "Current routine") dls.push({ t: "Routine", v: rout[n], col: "var(--muted)" });
   if (edt) dls.push({ t: "Edit", v: edt[n], col: "var(--edit)" });
   dls.forEach((d) => (d.y = Yr(d.v)));
   dls.sort((a, b) => a.y - b.y);
   for (let i = 1; i < dls.length; i++) if (dls[i].y - dls[i - 1].y < 13) dls[i].y = dls[i - 1].y + 13;
-  dls.forEach((d) => o.push('<circle cx="' + x(n) + '" cy="' + Yr(d.v) + '" r="3" fill="' + d.col + '" stroke="var(--surface)" stroke-width="2"/><text class="dl" x="' + (x(n) + 7) + '" y="' + (d.y + 4) + '">' + d.t + "</text>"));
+  dls.forEach((d) => o.push('<circle cx="' + x(n) + '" cy="' + Yr(d.v) + '" r="3" fill="' + d.col + '" stroke="var(--surface)" stroke-width="2"/><text class="dl" x="' + (x(n) + 6) + '" y="' + (d.y + 4) + '">' + d.t + "</text>"));
 
   // ---- outside lane
   const OL = lanes[1];
   const outs = rows.map((r) => r.outdoor);
   const olo = Math.floor(Math.min(...outs) - 0.5), ohi = Math.ceil(Math.max(...outs) + 0.5);
-  const ostep = Math.max(1, Math.ceil((ohi - olo) / 2));
-  const Yo = gridY(OL, olo, ohi, ostep, (v) => v + "°");
+  const Yo = gridY(OL, olo, ohi, Math.max(1, Math.ceil((ohi - olo) / 2)), (v) => v + "°");
   if (olo < 0 && ohi > 0) o.push('<line class="base" x1="' + L + '" x2="' + (W - R) + '" y1="' + Yo(0) + '" y2="' + Yo(0) + '"/>');
   o.push('<path d="' + path(outs, (i) => x(i + 0.5), Yo) + '" fill="none" stroke="var(--ink-2)" stroke-width="2" stroke-linecap="round"/>');
 
@@ -282,7 +364,7 @@ function renderTimeline() {
   const Ye = gridY(EL, 0, ehi, ehi > 2 ? 1 : 0.5, (v) => v);
   o.push('<line class="base" x1="' + L + '" x2="' + (W - R) + '" y1="' + Ye(0) + '" y2="' + Ye(0) + '"/>');
   const bw = x(4) - x(0);
-  const bar = (x0, w, v, col) => { if (v <= 0.005) return ""; const y0 = Ye(v), h = Ye(0) - y0, r = Math.min(3, w / 2, h); return '<path d="M' + x0 + "," + Ye(0) + "V" + (y0 + r) + "Q" + x0 + "," + y0 + " " + (x0 + r) + "," + y0 + "H" + (x0 + w - r) + "Q" + (x0 + w) + "," + y0 + " " + (x0 + w) + "," + (y0 + r) + "V" + Ye(0) + 'Z" fill="' + col + '"/>'; };
+  const bar = (x0, w, v, col) => { if (v <= 0.005 || w <= 0) return ""; const y0 = Ye(v), h = Ye(0) - y0, r = Math.min(3, w / 2, h); return '<path d="M' + x0 + "," + Ye(0) + "V" + (y0 + r) + "Q" + x0 + "," + y0 + " " + (x0 + r) + "," + y0 + "H" + (x0 + w - r) + "Q" + (x0 + w) + "," + y0 + " " + (x0 + w) + "," + (y0 + r) + "V" + Ye(0) + 'Z" fill="' + col + '"/>'; };
   hp.forEach((v, k) => {
     const x0 = x(k * 4) + 1;
     if (he) { const w = (bw - 4) / 2; o.push(bar(x0, w, v, "var(--plan)") + bar(x0 + w + 2, w, he[k], "var(--edit)")); }
@@ -294,9 +376,9 @@ function renderTimeline() {
   const cap = S.cfg.battery.capacity_kwh;
   const Yb = gridY(BL, 0, cap, cap / 2, (v) => v);
   const socs = [p.soc0_kwh].concat(rows.map((r) => r.soc));
-  o.push('<path d="' + path(socs, Xr, Yb) + "L" + x(n) + "," + Yb(0) + "L" + x(0) + "," + Yb(0) + 'Z" fill="var(--plan)" opacity=".14"/>');
-  o.push('<path d="' + path(socs, Xr, Yb) + '" fill="none" stroke="var(--plan)" stroke-width="2"/>');
-  if (ed) o.push('<path d="' + path([p.soc0_kwh].concat(ed.map((r) => r.soc)), Xr, Yb) + '" fill="none" stroke="var(--edit)" stroke-width="2"/>');
+  o.push('<path d="' + path(socs, x, Yb) + "L" + x(n) + "," + Yb(0) + "L" + x(0) + "," + Yb(0) + 'Z" fill="var(--plan)" opacity=".14"/>');
+  o.push('<path d="' + path(socs, x, Yb) + '" fill="none" stroke="var(--plan)" stroke-width="2"/>');
+  if (ed) o.push('<path d="' + path([p.soc0_kwh].concat(ed.map((r) => r.soc)), x, Yb) + '" fill="none" stroke="var(--edit)" stroke-width="2"/>');
   o.push('<line class="base" x1="' + L + '" x2="' + (W - R) + '" y1="' + Yb(0) + '" y2="' + Yb(0) + '"/>');
 
   // ---- x axis
@@ -311,23 +393,37 @@ function renderTimeline() {
   });
   o.push('<line id="tl-cross" x1="0" x2="0" y1="' + RIB + '" y2="' + (H - XA) + '" stroke="var(--ink)" stroke-width="1" visibility="hidden"/>');
   o.push('<rect id="tl-hit" x="' + L + '" y="0" width="' + (W - L - R) + '" height="' + H + '" fill="transparent"/>');
+
+  // ---- drag handles: one per block of the planned day
+  const vals = S.edit || planValues(), base = planValues();
+  const blockSpan = [];
+  S.cfg.blocks.forEach(([a, b], bi) => {
+    let i0 = -1, i1 = -1;
+    rows.forEach((r, j) => { if (r.t.slice(0, 10) !== p.for_date) return; const tt = parseT(r.t), hr = tt.getHours() + tt.getMinutes() / 60; if (hr >= a && hr < b) { if (i0 < 0) i0 = j; i1 = j; } });
+    if (i0 >= 0) blockSpan[bi] = [x(i0), x(i1 + 1)];
+  });
+  blockSpan.forEach((sp, bi) => {
+    if (!sp) return;
+    const cx = (sp[0] + sp[1]) / 2, cy = Yr(vals[bi]), changed = Math.abs(vals[bi] - base[bi]) > 1e-9, col = changed ? "var(--edit)" : "var(--ink-2)";
+    o.push('<g class="hdl" data-i="' + bi + '" transform="translate(' + cx + "," + cy + ')" tabindex="0" role="slider" aria-label="Setpoint ' + rng(...S.cfg.blocks[bi]) + '" aria-valuemin="' + c.min_setpoint_c + '" aria-valuemax="' + c.max_setpoint_c + '" aria-valuenow="' + vals[bi] + '">' +
+      '<circle r="18" fill="transparent"/><circle class="knob" r="7.5" fill="var(--surface)" stroke="' + col + '" stroke-width="2"/><path d="M-2.5,-1.6h5M-2.5,1.6h5" stroke="' + col + '" stroke-width="1.3"/>' +
+      '<text class="hdl-lab" y="-13" text-anchor="middle"></text></g>');
+  });
   o.push("</svg>");
   box.innerHTML = o.join("");
 
-  // legend
   const lg = ['<span><i class="sw" style="border-color:var(--plan)"></i>' + esc(chosenLabel()) + " plan</span>"];
   if (rout && p.chosen !== "Current routine") lg.push('<span><i class="sw dot" style="border-color:var(--muted)"></i>Your routine</span>');
   if (edt) lg.push('<span><i class="sw" style="border-color:var(--edit)"></i>Your edit</span>');
   lg.push('<span><i class="sw dash" style="border-color:var(--ink-2)"></i>Setpoint</span>', '<span><i class="sw box" style="background:var(--below)"></i>Below comfort floor</span>', '<span><i class="sw box" style="background:var(--cosy)"></i>Cosy</span>', '<span><i class="sw box" style="background:var(--peak)"></i>Peak</span>');
   $("#tl-legend").innerHTML = lg.join("");
-  $("#tl-foot").textContent = "From " + fmtDate(t0) + " " + hh(t0.getHours() + t0.getMinutes() / 60) + " to " + fmtDate(tN) + " " + hh(tN.getHours()) + ". Starting room " + deg(p.t_room0) + ", battery " + p.soc0_kwh + " kWh. The battery charges in Cosy windows and covers the house and pump at other times.";
+  $("#tl-foot").innerHTML = "<b>Drag a handle</b> up or down to try a different setpoint for that block. It's simulated straight away; nothing is pushed until you choose to. Window " + fmtDate(t0) + " " + hh(t0.getHours() + t0.getMinutes() / 60) + " to " + fmtDate(tN) + " " + hh(tN.getHours()) + "; starting room " + deg(p.t_room0) + ", battery " + p.soc0_kwh + " kWh.";
 
-  // hover
-  const hit = $("#tl-hit"), cross = $("#tl-cross"), tip = $("#tip");
+  // hover readout
+  const svg = box.querySelector("svg"), hit = $("#tl-hit"), cross = $("#tl-cross"), tip = $("#tip");
   const show = (ev) => {
-    const rect = box.querySelector("svg").getBoundingClientRect();
-    const px = ev.clientX - rect.left;
-    const i = Math.max(0, Math.min(n - 1, Math.floor(((px - L) / (W - L - R)) * n)));
+    const rect = svg.getBoundingClientRect();
+    const i = Math.max(0, Math.min(n - 1, Math.floor(((ev.clientX - rect.left - L) / (W - L - R)) * n)));
     const r = rows[i], t = parseT(r.t), tf = tariff(t.getHours());
     cross.setAttribute("x1", x(i + 1)); cross.setAttribute("x2", x(i + 1)); cross.setAttribute("visibility", "visible");
     const cls = { home: "Home, awake", sleep: "Asleep", away: "Out" }[r.cls] || r.cls;
@@ -345,15 +441,44 @@ function renderTimeline() {
   };
   const hide = () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); };
   hit.addEventListener("pointermove", show); hit.addEventListener("pointerdown", show); hit.addEventListener("pointerleave", hide);
+
+  // drag handles
+  const toVal = (clientY) => {
+    const py = clientY - svg.getBoundingClientRect().top;
+    const v = rlo + (1 - (py - RL.y0) / RL.h) * (rhi - rlo);
+    return Math.max(c.min_setpoint_c, Math.min(c.max_setpoint_c, Math.round(v * 2) / 2));
+  };
+  box.querySelectorAll(".hdl").forEach((g) => {
+    const bi = +g.dataset.i, sp = blockSpan[bi], cx = (sp[0] + sp[1]) / 2, lab = g.querySelector(".hdl-lab");
+    let v = vals[bi], dragging = false;
+    const place = (nv) => { v = nv; g.setAttribute("transform", "translate(" + cx + "," + Yr(v) + ")"); lab.textContent = v.toFixed(1) + "°"; g.setAttribute("aria-valuenow", v); };
+    const commit = () => { if (Math.abs(v - vals[bi]) > 1e-9) { const nv = (S.edit || planValues()).slice(); nv[bi] = v; setEdit(nv); } else lab.textContent = ""; };
+    g.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); dragging = true; g.setPointerCapture(e.pointerId); g.classList.add("dragging"); hide(); place(toVal(e.clientY)); });
+    g.addEventListener("pointermove", (e) => { if (dragging) place(toVal(e.clientY)); });
+    const end = () => { if (!dragging) return; dragging = false; g.classList.remove("dragging"); commit(); };
+    g.addEventListener("pointerup", end); g.addEventListener("pointercancel", end);
+    g.addEventListener("keydown", (e) => {
+      const d = e.key === "ArrowUp" || e.key === "ArrowRight" ? 0.5 : e.key === "ArrowDown" || e.key === "ArrowLeft" ? -0.5 : 0;
+      if (!d) return; e.preventDefault();
+      const nv = (S.edit || planValues()).slice(); nv[bi] = Math.max(c.min_setpoint_c, Math.min(c.max_setpoint_c, nv[bi] + d)); setEdit(nv);
+      setTimeout(() => box.querySelector('.hdl[data-i="' + bi + '"]')?.focus(), 400);
+    });
+  });
 }
-function chosenLabel() { return NAMES[S.plan.chosen] || S.plan.chosen; }
 
 /* ---------------------------------------------------------------- editor */
 let simTimer = null, simSeq = 0;
 function renderEditor() {
   const p = S.plan, base = planValues(), vals = S.edit || base, c = S.cfg.comfort;
   const d = dateOf(p.for_date);
-  $("#edit-sub").innerHTML = "Changes are simulated instantly against tonight's forecast. Nothing is sent to Home Assistant until you press Push. Editing <b>" + fmtDate(d) + "</b>.";
+  $("#edit-sub").innerHTML = "Changes are simulated against tonight's forecast. Nothing goes to Home Assistant until you press Push. Editing <b>" + fmtDate(d) + "</b>.";
+  const un = $("#undo");
+  const prev = p.manual && p.manual.previous;
+  un.hidden = !(p.chosen === "Your edit" && prev);
+  if (!un.hidden) {
+    un.innerHTML = "<span>You're running your own edit, pushed at <b>" + esc((p.manual.at || "").slice(11, 16)) + "</b>.</span>" + '<button type="button" class="btn ghost" id="undo-btn">Undo: back to ' + esc(NAMES[prev] || prev) + "</button>";
+    $("#undo-btn").onclick = undoEdit;
+  }
   const ed = $("#editor");
   ed.style.gridTemplateColumns = S.cfg.blocks.map(([a, b]) => Math.max(2.2, b - a) + "fr").join(" ");
   const lo = c.min_setpoint_c, hi = c.max_setpoint_c;
@@ -386,24 +511,33 @@ function setEdit(values) {
       S.editRes = r; $("#ed-msg").textContent = r.exact ? "" : "Approximate: this plan was made before what-if support, so solar gain is left out.";
     } catch (e) { $("#ed-msg").className = "msg err"; $("#ed-msg").textContent = e.message; }
     renderTimeline(); renderEdSummary();
-  }, 220);
+  }, 200);
 }
 function renderEdSummary() {
   const p = S.plan, ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
-  const r = editing() ? S.editRes : ch;
-  const dv = (a, b, money = true) => { const d = a - b; if (Math.abs(d) < 0.005) return '<span class="d">same</span>'; const good = d < 0; return '<span class="d ' + (good ? "up-good" : "up-bad") + '">' + (good ? "▼ " : "▲ ") + (money ? gbp(Math.abs(d)) : Math.abs(d).toFixed(1)) + (good ? " less" : " more") + "</span>"; };
-  const tiles = [
-    ["Model score", gbp(r.total), editing() ? dv(r.total, ch.total) + '<span class="d"> vs plan</span>' : '<span class="d">grid + comfort + end state</span>'],
-    ["vs your routine", gbp(Math.abs(cur.total - r.total)), '<span class="d">' + (cur.total - r.total >= 0 ? "better overall" : "worse overall") + "</span>"],
-    ["Electricity", gbp(r.grid_cost), editing() ? dv(r.grid_cost, ch.grid_cost) : '<span class="d">grid import</span>'],
-    ["Pump", r.kwh_hp.toFixed(1) + " kWh", editing() ? dv(r.kwh_hp, ch.kwh_hp, false).replace("less", "kWh less").replace("more", "kWh more") : '<span class="d">heating only</span>'],
-    ["Coldest awake", deg(r.t_min_awake), '<span class="d">' + (r.penalty > 0.05 ? "shortfall " + gbp(r.penalty) : "floors held") + "</span>"],
-  ];
-  $("#ed-summary").innerHTML = tiles.map(([k, v, d]) => '<div class="tile"><div class="k">' + k + '</div><div class="v">' + v + "</div>" + d + "</div>").join("");
+  const e = editing(), r = e ? S.editRes : ch;
+  const vsPlan = (a, b, unit) => { if (!e) return ""; const d = a - b; if (Math.abs(d) < 0.005) return '<span class="d">same as plan</span>'; return '<span class="d ' + (d < 0 ? "up-good" : "up-bad") + '">' + (d < 0 ? "▼ " : "▲ ") + (unit ? Math.abs(d).toFixed(1) + " " + unit : gbp(Math.abs(d))) + (d < 0 ? " less" : " more") + " than plan</span>"; };
+  const dg = r.grid_cost - cur.grid_cost;
+  $("#ed-summary").innerHTML = [
+    tile("Electricity", gbp(r.grid_cost), vsPlan(r.grid_cost, ch.grid_cost) || moneyDelta(r.grid_cost, cur.grid_cost)),
+    tile("vs your routine", (dg > 0.005 ? "+" : "") + gbp(dg), dg <= 0.005 ? "electricity saved" : "extra electricity"),
+    tile("Comfort", comfortText(r, true), e ? "plan: " + comfortText(ch, true).toLowerCase() : "routine: " + comfortText(cur, true).toLowerCase()),
+    tile("Pump", r.kwh_hp.toFixed(1) + " kWh", vsPlan(r.kwh_hp, ch.kwh_hp, "kWh") || "heating only"),
+    tile("Coldest awake", deg(r.t_min_awake), "floor " + deg(S.cfg.comfort.soft_floor_c)),
+  ].join("");
+  $("#ed-score").textContent = "Model score " + gbp(r.total) + (e ? " (plan " + gbp(ch.total) + ", routine " + gbp(cur.total) + ")" : " (routine " + gbp(cur.total) + ")") + ". Lower is better: electricity plus a price on comfort shortfall.";
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const past = dateOf(p.for_date) < today;
-  $("#ed-push").disabled = !editing() || past;
-  $("#ed-push").title = past ? "This plan's day has passed. Re-run the optimiser first." : editing() ? "" : "Change a setpoint first";
+  $("#ed-push").disabled = !e || past;
+  $("#ed-push").title = past ? "This plan's day has passed. Re-run the optimiser first." : e ? "" : "Change a setpoint first";
+}
+async function undoEdit() {
+  const p = S.plan, prev = p.manual.previous, vals = p.strategies[prev].values;
+  const body = "<p>This puts the planner's <b>" + esc(NAMES[prev] || prev) + "</b> plan back into <code>" + esc(S.cfg.schedule_entity) + "</code> for " + WDL[wdIdx(dateOf(p.for_date))] + ".</p>" + strip(tidy(vals));
+  if (!(await confirmDlg("Undo your edit?", body, "Undo"))) return;
+  const m = $("#ed-msg"); m.className = "msg"; m.textContent = "Restoring…";
+  try { const r = await api("/api/restore", {}); await loadAll(); $("#ed-msg").className = "msg " + (r.pushed.verified ? "ok" : "err"); $("#ed-msg").textContent = r.pushed.verified ? "Restored and verified." : "Restored, but the read-back did not match."; }
+  catch (e) { m.className = "msg err"; m.textContent = e.message; }
 }
 function wireEditor() {
   $("#ed-reset").onclick = () => setEdit(planValues());
@@ -412,23 +546,23 @@ function wireEditor() {
   $("#ed-push").onclick = async () => {
     const vals = S.edit, p = S.plan;
     const blocks = tidy(vals);
-    const body = "<p>This writes <b>" + WDL[wdIdx(dateOf(p.for_date))] + "</b> in <code>" + esc(S.cfg.schedule_entity) + "</code>. Your live schedule is not touched.</p>" +
+    const body = "<p>This writes <b>" + WDL[wdIdx(dateOf(p.for_date))] + "</b> in <code>" + esc(S.cfg.schedule_entity) + "</code>. Your live schedule is not touched, and you can undo it afterwards.</p>" +
       strip(blocks) + '<p style="font-variant-numeric:tabular-nums">' + blocks.map((b) => rng(b.from, b.to) + " " + b.temperature.toFixed(1) + "°").join(" · ") + "</p>";
     if (!(await confirmDlg("Push your edited plan?", body, "Push"))) return;
     const m = $("#ed-msg"); m.className = "msg"; m.textContent = "Pushing…";
     try {
       const r = await api("/api/push", { values: vals });
-      m.className = "msg " + (r.pushed.verified ? "ok" : "err");
-      m.textContent = r.pushed.verified ? "Pushed and verified." : "Pushed, but the read-back did not match.";
       await loadAll();
+      $("#ed-msg").className = "msg " + (r.pushed.verified ? "ok" : "err");
+      $("#ed-msg").textContent = r.pushed.verified ? "Pushed and verified." : "Pushed, but the read-back did not match.";
     } catch (e) { m.className = "msg err"; m.textContent = e.message; }
   };
 }
 
 /* ---------------------------------------------------------------- strategies */
-function sparkline(vals, col, lo, hi, W = 240, H = 44) {
+function sparkline(vals, col, lo, hi, W = 240, H = 44, floor = true) {
   const X = (i) => 2 + ((W - 4) * i) / (vals.length - 1), Y = (v) => 4 + (H - 8) * (1 - (v - lo) / (hi - lo));
-  return '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" height="' + H + '" preserveAspectRatio="none" aria-hidden="true"><line class="gl" x1="0" x2="' + W + '" y1="' + Y(S.cfg.comfort.soft_floor_c) + '" y2="' + Y(S.cfg.comfort.soft_floor_c) + '" stroke-dasharray="3 3"/><path d="' + vals.map((v, i) => (i ? "L" : "M") + X(i).toFixed(1) + "," + Y(v).toFixed(1)).join("") + '" fill="none" stroke="' + col + '" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>';
+  return '<svg viewBox="0 0 ' + W + " " + H + '" width="100%" height="' + H + '" preserveAspectRatio="none" aria-hidden="true">' + (floor ? '<line class="gl" x1="0" x2="' + W + '" y1="' + Y(S.cfg.comfort.soft_floor_c) + '" y2="' + Y(S.cfg.comfort.soft_floor_c) + '" stroke-dasharray="3 3"/>' : "") + '<path d="' + vals.map((v, i) => (i ? "L" : "M") + X(i).toFixed(1) + "," + Y(v).toFixed(1)).join("") + '" fill="none" stroke="' + col + '" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>';
 }
 function renderStrategies() {
   const p = S.plan, cur = p.strategies["Current routine"], cmp = p.compare || {};
@@ -438,46 +572,49 @@ function renderStrategies() {
   const all = names.flatMap((n) => (cmp[n] ? cmp[n].room : []));
   const lo = Math.min(...all, S.cfg.comfort.soft_floor_c) - 0.2, hi = Math.max(...all) + 0.2;
   $("#st-cards").innerHTML = names.map((n) => {
-    const r = p.strategies[n], d = cur.total - r.total, chosen = n === p.chosen;
-    const ex = n === "Current routine" ? ["the setpoints from your live schedule"] : explain(r.values, cur.values);
-    const delta = n === "Current routine" ? '<span class="delta" style="color:var(--muted)">Baseline</span>' : '<span class="delta ' + (d >= 0.005 ? "up-good" : d <= -0.005 ? "up-bad" : "") + '">' + (Math.abs(d) < 0.005 ? "Same as routine" : (d > 0 ? "▼ " + gbp(d) + " better overall" : "▲ " + gbp(-d) + " worse overall")) + "</span>";
-    return '<article class="scard' + (chosen ? " is-chosen" : "") + '"><div class="nm"><i class="sw' + (n === "Current routine" ? " dot" : "") + '" style="border-color:' + COLOR[n] + '"></i>' + esc(NAMES[n] || n) + (chosen ? ' <span class="tag chosen">Chosen</span>' : "") + "</div>" +
-      '<div><div class="k-small">Model score</div><div class="big">' + gbp(r.total) + "</div>" + delta + "</div>" +
+    const r = p.strategies[n], chosen = n === p.chosen, base = n === "Current routine";
+    const ex = base ? ["the setpoints from your live schedule"] : explain(r.values, cur.values);
+    const ok = r.hours_below == null ? r.penalty < 0.05 : r.hours_below < 0.25;
+    return '<article class="scard' + (chosen ? " is-chosen" : "") + '"><div class="nm"><i class="sw' + (base ? " dot" : "") + '" style="border-color:' + COLOR[n] + '"></i>' + esc(NAMES[n] || n) + (chosen ? ' <span class="tag chosen">Chosen</span>' : "") + "</div>" +
+      '<div><div class="k-small">Electricity</div><div class="big">' + gbp(r.grid_cost) + "</div>" + (base ? '<span class="d" style="color:var(--muted)">Baseline</span>' : moneyDelta(r.grid_cost, cur.grid_cost)) + "</div>" +
+      '<div class="comfort ' + (ok ? "ok" : "low") + '"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' + (ok ? '<path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>' : '<path d="M8 3v6M8 12v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>') + "</svg>" + comfortText(r) + "</div>" +
       (cmp[n] ? sparkline(cmp[n].room, COLOR[n], lo, hi) : "") +
       strip(tidy(r.values), false) +
-      '<div class="kv"><span>Electricity</span><b>' + gbp(r.grid_cost) + (n === "Current routine" ? "" : ' <span class="' + (r.grid_cost <= cur.grid_cost ? "up-good" : "up-bad") + '">(' + (r.grid_cost <= cur.grid_cost ? "−" : "+") + "£" + Math.abs(r.grid_cost - cur.grid_cost).toFixed(2) + ")</span>") + "</b><span>Comfort shortfall</span><b>" + gbp(r.penalty) + "</b><span>Pump</span><b>" + r.kwh_hp.toFixed(1) + " kWh</b><span>Coldest awake</span><b>" + deg(r.t_min_awake) + "</b></div>" +
+      '<div class="kv"><span>Pump</span><b>' + r.kwh_hp.toFixed(1) + " kWh</b><span>Coldest awake</span><b>" + deg(r.t_min_awake) + "</b><span>Model score</span><b>" + gbp(r.total) + "</b></div>" +
       '<p class="why">' + (ex.length ? esc(ex.slice(0, 3).join("; ")) : "Same setpoints as your routine.") + "</p>" +
       '<button type="button" class="btn ghost" data-try="' + esc(n) + '">Open in editor</button></article>';
   }).join("");
-  document.querySelectorAll("[data-try]").forEach((b) => b.addEventListener("click", () => { setEdit(p.strategies[b.dataset.try].values.slice()); $("#edit").scrollIntoView(); }));
-  const nb = p.strategies["Optimised (no battery, for reference)"];
-  renderBreakdown(nb);
+  document.querySelectorAll("[data-try]").forEach((b) => b.addEventListener("click", () => {
+    setEdit(p.strategies[b.dataset.try].values.slice());
+    if (MOBILE()) setTab("plan"); else $("#edit").scrollIntoView();
+  }));
 }
-function renderBreakdown(nb) {
-  const p = S.plan, cmp = p.compare;
-  const box = $("#breakdown");
+function renderBreakdown() {
+  const p = S.plan, cmp = p.compare, box = $("#breakdown");
+  if (!box.offsetParent) return;
   const chName = cmp && cmp[p.chosen] ? p.chosen : "Optimised";
-  if (!cmp || !cmp["Current routine"] || chName === "Current routine") { box.innerHTML = '<p class="foot">The routine was kept, so there is no saving to break down.</p>'; $("#br-sub").textContent = ""; return; }
+  if (!cmp || !cmp["Current routine"] || chName === "Current routine") { box.innerHTML = '<p class="foot">The routine was kept, so there is nothing to break down.</p>'; $("#br-sub").textContent = ""; return; }
   const comps = [["cosy", "Cosy-rate electricity"], ["standard", "Standard-rate electricity"], ["peak", "Peak-rate electricity"], ["penalty", "Comfort shortfall"], ["terminal", "Heat left in the house"], ["battery", "Battery left over"]];
   const a = cmp["Current routine"].breakdown, b = cmp[chName].breakdown;
   const rows = comps.map(([k, l]) => ({ l, v: a[k] - b[k] }));
   const net = rows.reduce((s, r) => s + r.v, 0);
-  $("#br-sub").textContent = NAMES[chName] + " vs your routine";
-  const W = Math.max(300, box.clientWidth || 600), narrow = W < 560;
-  const LW = narrow ? 150 : 200, VW = 64, rowH = 30;
+  $("#br-sub").textContent = "Score difference by part: " + NAMES[chName] + " vs your routine";
+  const W = Math.max(280, box.clientWidth || 600), narrow = W < 560;
+  const LW = narrow ? 140 : 200, VW = 60, rowH = 30;
   const m = Math.max(0.05, ...rows.map((r) => Math.abs(r.v)));
   const cx = LW + (W - LW - VW) / 2, sc = (W - LW - VW) / 2 / m;
   const H = rows.length * rowH + 30;
-  const o = ['<svg width="' + W + '" height="' + H + '" role="img" aria-label="Saving by component">'];
-  o.push('<text class="ax" x="' + (cx - 6) + '" y="12" text-anchor="end">◀ costs more</text><text class="ax" x="' + (cx + 6) + '" y="12">saves ▶</text>');
+  const o = ['<svg width="' + W + '" height="' + H + '" role="img" aria-label="Score difference by component">'];
+  o.push('<text class="ax" x="' + (cx - 6) + '" y="12" text-anchor="end">◀ worse</text><text class="ax" x="' + (cx + 6) + '" y="12">better ▶</text>');
   rows.forEach((r, i) => {
     const y = 22 + i * rowH, w = Math.abs(r.v) * sc;
-    o.push('<text x="0" y="' + (y + 15) + '" style="fill:var(--ink-2);font-size:13px">' + r.l + "</text>");
-    if (w > 0.5) o.push('<rect x="' + (r.v >= 0 ? cx : cx - w) + '" y="' + (y + 4) + '" width="' + w + '" height="16" rx="3" fill="' + (r.v >= 0 ? "var(--plan)" : "var(--crit)") + '"><title>' + r.l + ": " + (r.v >= 0 ? "saves " : "costs ") + gbp(Math.abs(r.v)) + "</title></rect>");
+    o.push('<text x="0" y="' + (y + 15) + '" style="fill:var(--ink-2);font-size:' + (narrow ? 12 : 13) + 'px">' + r.l + "</text>");
+    if (w > 0.5) o.push('<rect x="' + (r.v >= 0 ? cx : cx - w) + '" y="' + (y + 4) + '" width="' + w + '" height="16" rx="3" fill="' + (r.v >= 0 ? "var(--plan)" : "var(--crit)") + '"><title>' + r.l + ": " + gbp(Math.abs(r.v)) + (r.v >= 0 ? " better" : " worse") + "</title></rect>");
     o.push('<text x="' + W + '" y="' + (y + 16) + '" text-anchor="end" style="fill:var(--ink);font-size:13px;font-variant-numeric:tabular-nums">' + (r.v >= 0 ? "+" : "−") + "£" + Math.abs(r.v).toFixed(2) + "</text>");
   });
   o.push('<line class="base" x1="' + cx + '" x2="' + cx + '" y1="18" y2="' + (H - 6) + '"/></svg>');
-  box.innerHTML = o.join("") + '<p class="foot">Net model saving <b style="color:var(--ink)">' + gbp(net) + "</b>." + (nb ? " Without the battery the optimised plan would cost " + gbp(nb.total) + " in model terms." : "") + " Comfort shortfall and end-state heat are priced so that cold rooms and a cold house at the end of the window count against a plan.</p>";
+  const nb = p.strategies["Optimised (no battery, for reference)"];
+  box.innerHTML = o.join("") + '<p class="foot">Net score difference ' + gbp(net) + "." + (nb ? " Without the battery the optimised plan would need " + gbp(nb.grid_cost) + " of electricity." : "") + "</p>";
 }
 
 /* ---------------------------------------------------------------- week */
@@ -485,59 +622,60 @@ function renderWeek() {
   const p = S.plan, occ = S.cfg.occupancy;
   const stLabel = (s) => ({ home: "Home all day", away_day: "Out " + rng(occ.away_from, occ.away_to), away_all: "Away all day" }[s] || s);
   const ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
-  const meanOf = p.forecast_tomorrow.mean;
-  const cards = [{ date: p.for_date, status: p.occupancy?.status_tomorrow, mean: meanOf, total: ch.total, cur: cur.total, blocks: p.blocks, kwh: ch.kwh_hp, first: true }]
-    .concat((p.outlook || []).filter((o) => !o.error).map((o) => ({ date: o.date, status: o.status, mean: o.forecast_mean, total: o.total, cur: o.current_total, blocks: o.blocks, kwh: o.kwh_hp })));
+  const cards = [{ date: p.for_date, status: p.occupancy?.status_tomorrow, mean: p.forecast_tomorrow.mean, grid: ch.grid_cost, curGrid: cur.grid_cost, hb: ch.hours_below, pen: ch.penalty, blocks: p.blocks, kwh: ch.kwh_hp, first: true }]
+    .concat((p.outlook || []).filter((o) => !o.error).map((o) => ({ date: o.date, status: o.status, mean: o.forecast_mean, grid: o.grid_cost, curGrid: o.current_grid_cost, hb: o.hours_below, pen: o.penalty, blocks: o.blocks, kwh: o.kwh_hp })));
   $("#week-cards").innerHTML = cards.map((c) => {
-    const d = dateOf(c.date), sv = c.cur - c.total;
-    return '<div class="day' + (c.first ? " first" : "") + '"><div class="dn">' + WD[wdIdx(d)] + " " + d.getDate() + "<span>" + (c.first ? "pushed" : deg(c.mean, 0)) + "</span></div>" +
-      '<div class="meta">' + esc(stLabel(c.status)) + (c.first ? " · " + deg(c.mean, 0) : "") + "</div>" +
-      '<div class="cost">' + gbp(c.total) + "</div>" +
-      '<div class="meta ' + (sv > 0.005 ? "up-good" : "") + '">' + (sv > 0.005 ? "▼ " + gbp(sv) + " vs routine" : "Same as routine") + "</div>" +
-      strip(c.blocks, false) + '<div class="meta">' + (c.kwh != null ? c.kwh.toFixed(0) + " kWh pump" : "") + "</div></div>";
+    const d = dateOf(c.date);
+    const delta = c.curGrid != null ? (Math.abs(c.curGrid - c.grid) < 0.005 ? '<div class="meta">Same as routine</div>' : '<div class="meta ' + (c.grid < c.curGrid ? "up-good" : "up-bad") + '">' + (c.grid < c.curGrid ? "▼ " + gbp(c.curGrid - c.grid) + " less" : "▲ " + gbp(c.grid - c.curGrid) + " more") + " than routine</div>") : "";
+    return '<div class="day' + (c.first ? " first" : "") + '"><div class="dn">' + WD[wdIdx(d)] + " " + d.getDate() + "<span>" + deg(c.mean, 0) + "</span></div>" +
+      '<div class="meta">' + esc(stLabel(c.status)) + (c.first ? ' · <b class="pushed">pushed</b>' : "") + "</div>" +
+      '<div class="cost">' + gbp(c.grid) + "<small> electricity</small></div>" + delta +
+      strip(c.blocks, false) + '<div class="meta">' + (c.kwh != null ? Math.round(c.kwh) + " kWh pump · " : "") + comfortText({ hours_below: c.hb, penalty: c.pen }, true).toLowerCase() + "</div></div>";
   }).join("");
-  const a = seqColor(16).bg, b = seqColor(22).bg;
-  $("#sp-scale").innerHTML = "<span>Setpoint</span><span>16°</span><span class='ramp' style='background:linear-gradient(90deg," + a + "," + b + ")'></span><span>22°</span><span>· costs are model totals for each 30 h window</span>";
+  $("#sp-scale").innerHTML = "<span>Setpoint</span><span>16°</span><span class='ramp' style='background:linear-gradient(90deg," + seqColor(16).bg + "," + seqColor(22).bg + ")'></span><span>22°</span><span>· electricity for each 30 h window incl. house load</span>";
 }
 
-/* ---------------------------------------------------------------- occupancy */
+/* ---------------------------------------------------------------- occupancy (two-week calendar) */
+const OCC_NEXT = { home: "away_day", away_day: "away_all", away_all: "home" };
+const OCC_LABEL = { home: "Home", away_day: "Out", away_all: "Away" };
 function renderOcc() {
   const occ = S.cfg.occupancy;
-  $("#occ-days").innerHTML = WD.map((n, i) => '<button type="button" class="tg" data-wd="' + i + '" aria-pressed="' + occ.away_weekdays.includes(i) + '">' + n + "</button>").join("");
-  $("#occ-days").querySelectorAll(".tg").forEach((b) => b.addEventListener("click", () => { b.setAttribute("aria-pressed", b.getAttribute("aria-pressed") !== "true"); refreshUsual(); }));
-  $("#occ-from").value = occ.away_from; $("#occ-to").value = occ.away_to;
+  if (!S.occ) { S.occ = { aw: occ.away_weekdays.slice(), ov: { ...(occ.overrides || {}) } }; $("#occ-from").value = occ.away_from; $("#occ-to").value = occ.away_to; }
+  $("#occ-days").innerHTML = WD.map((n, i) => '<button type="button" class="tg" data-wd="' + i + '" aria-pressed="' + S.occ.aw.includes(i) + '">' + n + "</button>").join("");
+  $("#occ-days").querySelectorAll(".tg").forEach((b) => b.addEventListener("click", () => {
+    const i = +b.dataset.wd; S.occ.aw = S.occ.aw.includes(i) ? S.occ.aw.filter((x) => x !== i) : S.occ.aw.concat(i); renderOcc();
+  }));
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  const opts = [["home", "Home"], ["away_day", "Out daytime"], ["away_all", "Away"]];
-  let h = "";
-  for (let i = 0; i < 8; i++) {
-    const d = new Date(today.getTime() + i * 864e5), iso = isoDate(d);
-    const usual = occ.away_weekdays.includes(wdIdx(d)) ? "away_day" : "home";
-    const eff = (occ.overrides || {})[iso] || usual;
-    h += '<div class="drow"><div class="dl2">' + fmtDate(d) + "<small>" + (i === 0 ? "Today" : i === 1 ? "Tomorrow" : "") + '</small></div><div class="seg" role="radiogroup" aria-label="' + fmtDate(d) + '">' +
-      opts.map(([k, l]) => '<label><input type="radio" name="d_' + iso + '" value="' + k + '"' + (eff === k ? " checked" : "") + "><span>" + l + "</span></label>").join("") +
-      '</div><div class="usual" data-usual="' + iso + '"></div></div>';
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate() - wdIdx(today));
+  const end = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 13);
+  let h = WD.map((n) => '<div class="cal-h">' + n.slice(0, 2) + "</div>").join("");
+  for (let d = new Date(start); d <= end || wdIdx(d) !== 0; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) {
+    const iso = isoDate(d);
+    if (d < today || d > end) { h += '<div class="cal-d off"><span class="dd">' + d.getDate() + "</span></div>"; continue; }
+    const usual = S.occ.aw.includes(wdIdx(d)) ? "away_day" : "home";
+    const eff = S.occ.ov[iso] || usual;
+    const changed = eff !== usual;
+    h += '<button type="button" class="cal-d ' + eff + (changed ? " ov" : "") + (iso === isoDate(today) ? " today" : "") + '" data-iso="' + iso + '" aria-label="' + fmtDate(d) + ": " + OCC_LABEL[eff] + (changed ? " (changed from usual)" : "") + '">' +
+      '<span class="dd">' + d.getDate() + (d.getDate() === 1 || iso === isoDate(today) ? " " + MON[d.getMonth()] : "") + '</span><span class="st">' + OCC_LABEL[eff] + "</span></button>";
   }
-  $("#occ-dates").innerHTML = h;
-  refreshUsual();
+  $("#occ-cal").innerHTML = h;
+  $("#occ-cal").querySelectorAll("button.cal-d").forEach((b) => b.addEventListener("click", () => {
+    const iso = b.dataset.iso, usual = S.occ.aw.includes(wdIdx(dateOf(iso))) ? "away_day" : "home";
+    const nxt = OCC_NEXT[S.occ.ov[iso] || usual];
+    if (nxt === usual) delete S.occ.ov[iso]; else S.occ.ov[iso] = nxt;
+    renderOcc();
+    $('#occ-cal [data-iso="' + iso + '"]')?.focus();
+  }));
   const hint = S.params?.info?.presence_hint || {};
   const hs = Object.entries(hint).map(([k, v]) => WD[+k] + " " + Math.round(v.home_share * 100) + "%");
   $("#occ-hint").textContent = hs.length ? "From your phone's location, share of " + rng(occ.away_from, occ.away_to) + " spent at home recently: " + hs.join(" · ") + "." : "";
 }
-function awayDays() { return [...document.querySelectorAll("#occ-days .tg")].filter((b) => b.getAttribute("aria-pressed") === "true").map((b) => +b.dataset.wd); }
-function refreshUsual() {
-  const aw = awayDays();
-  document.querySelectorAll("[data-usual]").forEach((el) => {
-    const d = dateOf(el.dataset.usual), usual = aw.includes(wdIdx(d)) ? "away_day" : "home";
-    const sel = document.querySelector('input[name="d_' + el.dataset.usual + '"]:checked')?.value;
-    el.textContent = sel && sel !== usual ? "Usually " + (usual === "home" ? "home" : "out") : "";
-  });
-}
 function wireOcc() {
-  $("#occ-dates").addEventListener("change", refreshUsual);
   $("#occ-save").onclick = () => {
     const ov = {};
-    document.querySelectorAll("#occ-dates input:checked").forEach((x) => (ov[x.name.slice(2)] = x.value));
-    rerun("/api/occupancy", { away_weekdays: awayDays(), away_from: +$("#occ-from").value, away_to: +$("#occ-to").value, overrides: ov }, $("#occ-msg"));
+    $("#occ-cal").querySelectorAll("button.cal-d").forEach((b) => { const iso = b.dataset.iso, usual = S.occ.aw.includes(wdIdx(dateOf(iso))) ? "away_day" : "home"; ov[iso] = S.occ.ov[iso] || usual; });
+    Object.entries(S.occ.ov).forEach(([k, v]) => { if (!(k in ov)) ov[k] = v; });
+    rerun("/api/occupancy", { away_weekdays: S.occ.aw.slice().sort(), away_from: +$("#occ-from").value, away_to: +$("#occ-to").value, overrides: ov }, $("#occ-msg"));
   };
 }
 async function rerun(path, body, m) {
@@ -547,7 +685,7 @@ async function rerun(path, body, m) {
   for (let i = 0; i < 160; i++) {
     await new Promise((z) => setTimeout(z, 1500));
     const s = await api("/api/rerun-status").catch(() => ({}));
-    if (s.state === "done") { m.className = "msg ok"; m.textContent = "Done. New plan pushed."; await loadAll(); return; }
+    if (s.state === "done") { await loadAll(); m.className = "msg ok"; m.textContent = "Done. New plan pushed."; return; }
     if (s.state === "error") { m.className = "msg err"; m.textContent = "Failed: " + (s.message || "").slice(-160); return; }
   }
   m.textContent = "Still running. Refresh in a minute.";
@@ -562,25 +700,24 @@ function renderModel() {
   const ico = (c) => '<svg class="ico" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="9" fill="var(--' + c + ')"/><path d="' + (c === "good" ? "M6 10.5l2.5 2.5L14 7.5" : "M10 5.5v5.5M10 14v.5") + '" stroke="#0b0b0b" stroke-width="2" fill="none" stroke-linecap="round"/></svg>';
   const mature = days != null && days >= 28 && mae != null && act && mae / act < 0.15;
   $("#maturity").className = "banner " + (mature ? "good" : "warn");
-  $("#maturity").innerHTML = ico(mature ? "good" : "warn") + "<div>" + (mature ? "<b>Settled.</b> " + days + " days of data and daily error within 15%. The savings figures are reasonable estimates." :
-    "<b>Early days.</b> " + (days != null ? days + " days of data" : "Not much data yet") + (mae != null ? ", daily error about " + mae.toFixed(1) + " kWh on roughly " + act.toFixed(0) + " kWh" : "") + ". Treat savings as indicative until about 4 weeks of data are in.") + "</div>";
-  const tiles = [
-    ["Heat loss", (pr.ua_kw_per_k ?? 0).toFixed(3) + " kW/K", "≈ " + ((pr.ua_kw_per_k || 0) * 20).toFixed(1) + " kW at 0° out, 20° in"],
-    ["Free gains", (pr.gains_kw ?? 0).toFixed(2) + " kW", "people, appliances, base solar"],
-    ["Thermal mass", (pr.c_kwh_per_k ?? 0).toFixed(1) + " kWh/K", "seen by the thermostat room"],
-    ["Backtest error", mae != null ? mae.toFixed(1) + " kWh/day" : "–", info.heat_loss_r2 != null ? "heat-loss fit R² " + info.heat_loss_r2 : bt.length + " days tested"],
-  ];
-  $("#model-tiles").innerHTML = tiles.map(([k, v, d]) => '<div class="tile"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="d">' + d + "</div></div>").join("");
+  $("#maturity").innerHTML = ico(mature ? "good" : "warn") + "<div>" + (mature ? "<b>Settled.</b> " + days + " days of data and daily error within 15%. The figures are reasonable estimates." :
+    "<b>Early days.</b> " + (days != null ? days + " days of data" : "Not much data yet") + (mae != null ? ", daily error about " + mae.toFixed(1) + " kWh on roughly " + act.toFixed(0) + " kWh" : "") + ". Treat the savings as rough until about 4 weeks of data are in.") + "</div>";
+  $("#model-tiles").innerHTML = [
+    tile("Heat loss", (pr.ua_kw_per_k ?? 0).toFixed(3) + " kW/K", "≈ " + ((pr.ua_kw_per_k || 0) * 20).toFixed(1) + " kW at 0° out, 20° in"),
+    tile("Free gains", (pr.gains_kw ?? 0).toFixed(2) + " kW", "people, appliances, base solar"),
+    tile("Thermal mass", (pr.c_kwh_per_k ?? 0).toFixed(1) + " kWh/K", "seen by the thermostat room"),
+    tile("Backtest error", mae != null ? mae.toFixed(1) + " kWh/day" : "–", info.heat_loss_r2 != null ? "heat-loss fit R² " + info.heat_loss_r2 : bt.length + " days tested"),
+  ].join("");
   $("#model-notes").innerHTML = (pj.notes || []).map((n) => "<li>" + esc(n) + "</li>").join("") + "<li>Last fit " + esc((pj.fitted_at || "never").replace("T", " ")) + "</li>";
-  renderBacktest(bt);
   const hist = (pj.history || []).map((h) => h.params.ua_kw_per_k);
-  $("#ua-hist").innerHTML = hist.length > 1 ? sparkline(hist, "var(--plan)", Math.min(...hist) - 0.005, Math.max(...hist) + 0.005, 300, 60) + '<div class="foot">' + hist[0].toFixed(3) + " → " + hist[hist.length - 1].toFixed(3) + " over " + hist.length + " fits</div>" : '<p class="foot">Needs a few daily fits.</p>';
+  $("#ua-hist").innerHTML = hist.length > 1 ? sparkline(hist, "var(--plan)", Math.min(...hist) - 0.005, Math.max(...hist) + 0.005, 300, 60, false) + '<div class="foot">' + hist[0].toFixed(3) + " → " + hist[hist.length - 1].toFixed(3) + " over " + hist.length + " fits</div>" : '<p class="foot">Needs a few daily fits.</p>';
 }
 function renderBacktest(bt) {
   const box = $("#backtest");
+  if (!box.offsetParent) return;
   if (!bt.length) { box.innerHTML = '<p class="foot">No complete days to test yet.</p>'; return; }
   $("#bt-legend").innerHTML = '<span><i class="sw box" style="background:var(--plan)"></i>Model</span><span><i class="sw box" style="background:var(--measured)"></i>Measured</span>';
-  const W = Math.max(300, box.clientWidth || 500), H = 190, L = 34, R = 6, T = 10, B = 34;
+  const W = Math.max(280, box.clientWidth || 500), H = 190, L = 34, R = 6, T = 10, B = 34;
   const hi = Math.ceil(Math.max(...bt.flatMap((b) => [b.pred_kwh, b.actual_kwh])) / 5) * 5;
   const Y = (v) => T + (H - T - B) * (1 - v / hi), gw = (W - L - R) / bt.length, bw = Math.min(16, (gw - 6) / 2);
   const o = ['<svg width="' + W + '" height="' + H + '" role="img" aria-label="Predicted and measured pump kWh per day">'];
@@ -596,13 +733,13 @@ function renderBacktest(bt) {
 }
 function renderActuals() {
   const a = S.actuals, box = $("#actuals");
-  if (!a || !box) return;
+  if (!a || !box || !box.offsetParent) return;
   const d = dateOf(a.date);
   $("#act-title").textContent = fmtDate(d) + ": room temperature";
   const act = a.actual.filter((r) => r.room != null), pred = (a.predicted || []).filter((r) => r.room != null);
   if (!act.length) { box.innerHTML = '<p class="foot">No measurements stored for ' + fmtDate(d) + " yet.</p>"; return; }
   $("#act-legend").innerHTML = (pred.length ? '<span><i class="sw" style="border-color:var(--plan)"></i>Predicted</span>' : "") + '<span><i class="sw" style="border-color:var(--measured)"></i>Measured</span>';
-  const W = Math.max(300, box.clientWidth || 500), H = 190, L = 34, R = 8, T = 10, B = 24;
+  const W = Math.max(280, box.clientWidth || 500), H = 190, L = 34, R = 8, T = 10, B = 24;
   const vals = act.map((r) => r.room).concat(pred.map((r) => r.room));
   const lo = Math.floor(Math.min(...vals) - 0.3), hi = Math.ceil(Math.max(...vals) + 0.3);
   const X = (h) => L + ((W - L - R) * h) / 23, Y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
@@ -612,32 +749,48 @@ function renderActuals() {
   const line = (rs, col) => '<path d="' + rs.map((r, i) => (i ? "L" : "M") + X(r.h) + "," + Y(r.room)).join("") + '" fill="none" stroke="' + col + '" stroke-width="2" stroke-linejoin="round"/>';
   if (pred.length) o.push(line(pred, "var(--plan)"));
   o.push(line(act, "var(--measured)"));
-  act.forEach((r) => o.push('<circle cx="' + X(r.h) + '" cy="' + Y(r.room) + '" r="4" fill="var(--measured)" stroke="var(--surface)" stroke-width="2"><title>' + hh(r.h) + " measured " + r.room + "°" + "</title></circle>"));
+  act.forEach((r) => o.push('<circle cx="' + X(r.h) + '" cy="' + Y(r.room) + '" r="4" fill="var(--measured)" stroke="var(--surface)" stroke-width="2"><title>' + hh(r.h) + " measured " + r.room + "°</title></circle>"));
   o.push("</svg>");
   box.innerHTML = o.join("");
   const ka = a.actual.reduce((s, r) => s + (r.kwh || 0), 0), kp = (a.predicted || []).reduce((s, r) => s + (r.kwh || 0), 0);
   let err = "";
-  if (pred.length) { const m = {}; pred.forEach((r) => (m[r.h] = r.room)); const e = act.filter((r) => m[r.h] != null).map((r) => r.room - m[r.h]); if (e.length) err = " Measured ran " + Math.abs(e.reduce((s, v) => s + v, 0) / e.length).toFixed(1) + "° " + (e.reduce((s, v) => s + v, 0) >= 0 ? "warmer" : "cooler") + " than predicted on average."; }
+  if (pred.length) { const m = {}; pred.forEach((r) => (m[r.h] = r.room)); const e = act.filter((r) => m[r.h] != null).map((r) => r.room - m[r.h]); if (e.length) { const av = e.reduce((s, v) => s + v, 0) / e.length; err = " Measured ran " + Math.abs(av).toFixed(1) + "° " + (av >= 0 ? "warmer" : "cooler") + " than predicted on average."; } }
   $("#act-foot").textContent = "Pump electricity: measured " + ka.toFixed(1) + " kWh" + (pred.length ? ", predicted " + kp.toFixed(1) + " kWh (" + (a.strategy ? NAMES[a.strategy] || a.strategy : "") + ")." : ". No stored plan for this day.") + err;
+}
+function renderMeter() {
+  const a = S.actuals, box = $("#meter");
+  if (!box || !S.cfg) return;
+  const g = a && a.grid;
+  if (!g) {
+    $("#meter-sub").textContent = "not set up";
+    box.innerHTML = '<p class="sub">Add your Anker smart meter\'s grid-import energy sensor (kWh) to <code>config.json</code> as <code>"entities": {"grid_import_kwh": "sensor.…"}</code>, and optionally live grid power as <code>"grid_power"</code>. After the next 03:30 data run this panel shows what the house actually drew from the grid each day and what that cost at your Cosy rates.</p>';
+    return;
+  }
+  const d = dateOf(a.date);
+  $("#meter-sub").textContent = fmtDate(d) + (g.hours < 24 ? " · " + g.hours + " of 24 hours recorded" : "");
+  const s = g.kwh_by_slot, tot = g.kwh || 1;
+  const seg = (k, lab) => '<div class="mseg ' + k + '" style="flex:' + Math.max(0.0001, s[k]) + '" title="' + lab + " " + s[k].toFixed(1) + ' kWh"></div>';
+  box.innerHTML = '<div class="tiles three">' + tile("Grid import", g.kwh.toFixed(1) + " kWh", "whole house, from the meter") + tile("Cost at your rates", gbp(g.cost), "standing charge not included") +
+    tile("Bought at Cosy rate", Math.round((s.cosy / tot) * 100) + "%", "the higher the better") + "</div>" +
+    '<div class="mbar">' + seg("cosy", "Cosy") + seg("standard", "Standard") + seg("peak", "Peak") + "</div>" +
+    '<div class="legend" style="margin-top:6px"><span><i class="sw box" style="background:var(--cosy-solid)"></i>Cosy ' + s.cosy.toFixed(1) + ' kWh</span><span><i class="sw box" style="background:var(--muted)"></i>Standard ' + s.standard.toFixed(1) + ' kWh</span><span><i class="sw box" style="background:var(--crit)"></i>Peak ' + s.peak.toFixed(1) + " kWh</span></div>";
 }
 
 /* ---------------------------------------------------------------- history */
 function renderHistory() {
   const idx = S.idx.slice().reverse();
   const tot = idx.reduce((s, i) => s + (i.saving_gbp || 0), 0);
-  const kept = idx.filter((i) => i.chosen === "Current routine").length;
   const first = idx.length ? dateOf(idx[idx.length - 1].for_date) : null;
   $("#hist-tiles").innerHTML = [
-    ["Model-estimated saving", gbp(tot), idx.length + " plans since " + (first ? fmtDate(first) : "–")],
-    ["Average per day", idx.length ? gbp(tot / idx.length) : "–", "Not metered: an estimate against your routine"],
-  ].map(([k, v, d]) => '<div class="tile"><div class="k">' + k + '</div><div class="v">' + v + '</div><div class="d">' + d + "</div></div>").join("");
-  $("#hist-table").innerHTML = "<thead><tr><th>Day</th><th>Plan</th><th>Setpoints</th><th class='r'>Saving</th><th>Pushed</th></tr></thead><tbody>" +
+    tile("Model score gained", gbp(tot), idx.length + " plans since " + (first ? fmtDate(first) : "–")),
+    tile("Average per day", idx.length ? gbp(tot / idx.length) : "–", "Model estimate incl. comfort, not metered"),
+  ].join("");
+  $("#hist-table").innerHTML = "<thead><tr><th>Day</th><th>Plan</th><th>Setpoints</th><th class='r'>Score gain</th><th>Pushed</th></tr></thead><tbody>" +
     idx.slice(0, 14).map((i) => "<tr><td>" + fmtDate(dateOf(i.for_date)) + "</td><td>" + esc(NAMES[i.chosen] || i.chosen) + "</td><td>" + strip(i.blocks || [], false) + "</td><td class='r'>" + gbp(i.saving_gbp || 0) + "</td><td>" + (i.pushed ? (i.pushed.verified ? "✓ verified" : "unverified") : "preview") + "</td></tr>").join("") + "</tbody>";
   $("#log").innerHTML = S.log.slice().reverse().map((l) => {
     const rest = Object.entries(l).filter(([k]) => k !== "at" && k !== "event").map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join(" ");
     return '<li class="' + (l.event === "error" ? "e-error" : "") + '">' + esc((l.at || "").replace("T", " ")) + " <b>" + esc(l.event) + "</b> " + esc(rest.slice(0, 200)) + "</li>";
   }).join("");
-  void kept;
 }
 
 /* ---------------------------------------------------------------- dialog, theme, boot */
@@ -649,15 +802,22 @@ function confirmDlg(title, html, ok) {
 function wireTheme() {
   $("#theme").onclick = () => {
     const root = document.documentElement;
-    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
-    root.dataset.theme = dark ? "light" : "dark";
+    root.dataset.theme = isDark() ? "light" : "dark";
     try { localStorage.setItem("hp-theme", root.dataset.theme); } catch (e) { /* ignore */ }
     if (S.plan) render();
   };
 }
-let rz = null;
-addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (S.plan) { renderTimeline(); renderBreakdown(S.plan.strategies["Optimised (no battery, for reference)"]); renderBacktest((S.params || {}).backtest || []); renderActuals(); } }, 150); });
-wireTheme(); wireEditor(); wireOcc();
+function wireTabs() {
+  document.querySelectorAll(".tabbar button").forEach((b) => b.addEventListener("click", () => { history.replaceState(null, "", "#" + b.dataset.go); setTab(b.dataset.go); }));
+  document.querySelectorAll(".nav a").forEach((a) => a.addEventListener("click", () => setTab(tabForHash(a.getAttribute("href")) || "now", false)));
+  addEventListener("hashchange", () => { const t = tabForHash(location.hash); if (t) setTab(t, false); });
+  $("#score-fold").addEventListener("toggle", () => renderBreakdown());
+  setTab(tabForHash(location.hash) || "now", false);
+}
+let rz = null, wasMobile = MOBILE();
+addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (MOBILE() !== wasMobile) { wasMobile = MOBILE(); setTab(document.body.dataset.tab, false); } else drawCharts(); }, 150); });
+wireTheme(); wireEditor(); wireOcc(); wireTabs();
 loadAll().catch((e) => { $("#loading").textContent = "Could not load the plan: " + e.message; });
 setInterval(loadStatus, 60000);
-setInterval(() => { if (!S.edit && document.visibilityState === "visible") loadAll(); }, 300000);
+setInterval(() => { if (!S.edit && document.visibilityState === "visible" && !$("#dlg").open) loadAll(); }, 300000);
+if ("serviceWorker" in navigator && window.isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});

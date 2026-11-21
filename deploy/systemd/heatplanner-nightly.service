@@ -1,0 +1,11 @@
+[Unit]
+Description=Heat pump planner: collect, forecast, optimise, push tomorrow's schedule
+After=network-online.target
+[Service]
+Type=oneshot
+User=heatplanner
+Group=heatplanner
+WorkingDirectory=/opt/heatplanner
+EnvironmentFile=/etc/heatplanner.env
+ExecStart=/usr/bin/python3 -m heatplanner.cli nightly
+TimeoutStartSec=600

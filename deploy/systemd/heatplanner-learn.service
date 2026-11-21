@@ -1,0 +1,12 @@
+[Unit]
+Description=Heat pump planner daily model re-fit
+After=network-online.target
+[Service]
+Type=oneshot
+User=heatplanner
+Group=heatplanner
+WorkingDirectory=/opt/heatplanner
+EnvironmentFile=/etc/heatplanner.env
+ExecStart=/usr/bin/python3 -m heatplanner.cli collect 28
+ExecStart=/usr/bin/python3 -m heatplanner.cli learn
+TimeoutStartSec=900

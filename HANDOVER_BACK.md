@@ -68,6 +68,11 @@ diff /tmp/base_planner.py /tmp/live_planner.py && echo "live code matches the ba
 - **Edit:** a ±0.5 °C setpoint and ±1 water offset per block, re-simulated instantly through `/api/simulate`
   (no HA calls). "Push to Home Assistant" writes only the plan's weekday in `schedule.heat_pump_planner`,
   after a confirmation. "Undo" (`/api/restore`) puts the optimiser's choice back.
+  **Which day is shown:** the Plan view and editor open on the **next day**. A day picker and the Week cards open
+  any week-ahead day (`GET /api/day?date=`, rebuilt from the stored forecast with the outlook's assumptions).
+  Pushing a week-ahead day writes that weekday now **and pins it** in `data/day_overrides.json`, and
+  `build_plan()` uses a pinned edit for its day instead of re-optimising (chosen = "Your edit",
+  `manual.pinned`). Undo drops the pin. Today is only shown via **Edit today's plan** on the Now card.
   **Today's routine can be edited for blocks not yet ended.** During the day the plan is for today, so the
   editor locks ended blocks, and `push_values` refuses changes to them. After 22:00 (the plan is for
   tomorrow) a Today/Tomorrow switch appears: "Today" posts `{"day":"today", "today_values", "today_offsets"}`
@@ -125,7 +130,7 @@ diff /tmp/base_planner.py /tmp/live_planner.py && echo "live code matches the ba
 
 ### New endpoints
 `GET /api/status`, `/api/actuals?date=`, `/api/config`, `/api/log`, `/sw.js`, `/manifest.webmanifest`, `/static/*`;
-`POST /api/simulate`, `/api/push`, `/api/restore` (`occupancy`, `rerun` as before). See `README.md`.
+`GET /api/day?date=`; `POST /api/simulate`, `/api/push`, `/api/restore`, all taking `"date"` (`occupancy`, `rerun` as before). New data file: `data/day_overrides.json` (pinned future edits; safe to delete). See `README.md`.
 
 ## 3. Deploy steps (Hermes → LXC 122)
 1. **Back up first:**

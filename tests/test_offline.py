@@ -14,6 +14,11 @@ import make_demo_data as demo  # noqa: E402
 from heatplanner import data, planner  # noqa: E402
 
 
+def json_copy(x):
+    import json
+    return json.loads(json.dumps(x))
+
+
 class Offline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -156,6 +161,51 @@ class Offline(unittest.TestCase):
         with self.assertRaises(ValueError):                             # plan for today: use the normal editor
             planner.push_today(ha, self.cfg, self.plan, tv, offs)
         data.save_json("plan_latest.json", self.plan)
+
+    def test_week_ahead_view_pin_and_undo(self):
+        day = next(o["date"] for o in self.plan["outlook"] if "error" not in o)
+        v = planner.day_view(self.cfg, self.plan, day)
+        self.assertEqual(v["kind"], "outlook")
+        self.assertEqual(v["chosen"], "Optimised")
+        self.assertEqual(len(v["blocks_raw"]), len(self.cfg["blocks"]))
+        self.assertTrue(v["trace_best"] and v["trace_current"])
+        # simulating the preview's own values reproduces the view's numbers
+        opt = v["strategies"]["Optimised"]
+        r = planner.simulate_for_date(self.cfg, self.plan, day, opt["values"], opt["offsets"])
+        self.assertAlmostEqual(r["total"], opt["total"], places=6)
+        # pin an edit: written to that weekday now, and remembered for the nightly run
+        ha = self.fake()
+        vals = list(opt["values"]); vals[3] = 21.5
+        pushed, blocks = planner.push_future(ha, self.cfg, self.plan, day, vals, opt["offsets"])
+        self.assertTrue(pushed["verified"])
+        import datetime as dt
+        wd = planner.DAYS[dt.date.fromisoformat(day).weekday()]
+        self.assertIn(21.5, [b["data"]["temperature"] for b in ha.helper[wd]])
+        self.assertIn(day, planner.load_overrides())
+        v2 = planner.day_view(self.cfg, self.plan, day)
+        self.assertEqual(v2["chosen"], "Your edit")
+        self.assertTrue(planner.annotate_outlook(self.cfg, json_copy(self.plan))["outlook"][[o.get("date") for o in self.plan["outlook"]].index(day)]["edited"])
+        # undo puts the preview back and forgets the pin
+        planner.restore_future(ha, self.cfg, self.plan, day)
+        self.assertNotIn(day, planner.load_overrides())
+        with self.assertRaises(ValueError):
+            planner.day_view(self.cfg, self.plan, "2001-01-01")
+
+    def test_nightly_keeps_a_pinned_edit(self):
+        import datetime as dt
+        tmp = tempfile.mkdtemp()
+        now = dt.datetime.now(planner.LOCAL)
+        plan_day = (now.date() if now.hour < 22 else now.date() + dt.timedelta(days=1)).isoformat()
+        data.DATA_DIR = tmp
+        pinned = [19.0, 20.0, 19.0, 21.0, 20.0, 19.5, 17.0]
+        data.save_json("day_overrides.json", {plan_day: {"values": pinned, "offsets": [0, -1, -1, 0, 0, 0, 0], "at": "x"}})
+        demo.main(tmp)
+        p = data.load_json("plan_latest.json", None)
+        self.assertEqual(p["chosen"], "Your edit")
+        self.assertEqual([b["temperature"] for b in p["blocks_raw"]], pinned)
+        self.assertTrue(p["manual"]["pinned"])
+        self.assertIn("Optimised", p["strategies"])                      # still compared against the optimiser
+        data.DATA_DIR = self.tmp
 
     def test_comfort_hours_and_grid_meter(self):
         for r in self.plan["strategies"].values():

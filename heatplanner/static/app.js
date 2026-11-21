@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editOff: null, editRes: null, actuals: null, occ: null, day: "plan" };
+const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editOff: null, editRes: null, actuals: null, occ: null, sel: null, view: null };
 const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const WDL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -24,7 +24,7 @@ const MOBILE = () => matchMedia("(max-width: 759px)").matches;
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const gbp = (v) => (v < 0 ? "−£" : "£") + Math.abs(v).toFixed(2);
-const deg = (v, d = 1) => (v == null ? "–" : Number(v).toFixed(d) + "°");
+const deg = (v, d = 1) => (v == null ? "–" : Number(v).toFixed(d).replace(/^-(0(\.0+)?)$/, "$1") + "°");
 const hh = (h) => { const m = Math.round(h * 60); return String(Math.floor(m / 60) % 25).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0"); };
 const rng = (a, b) => hh(a) + "–" + hh(b);
 const parseT = (s) => { const [d, t] = s.split("T"); const [Y, M, D] = d.split("-").map(Number); const [h, m] = t.split(":").map(Number); return new Date(Y, M - 1, D, h, m); };
@@ -83,7 +83,7 @@ async function loadAll() {
   const [plan, params, idx, cfg, log] = await Promise.all(["/api/plan", "/api/params", "/api/plans", "/api/config", "/api/log"].map((p) => api(p).catch(() => null)));
   S.plan = plan && plan.for_date ? plan : null; S.params = params || {}; S.idx = idx || []; S.cfg = cfg; S.log = log || [];
   S.edit = null; S.editOff = null; S.editRes = null; S.occ = null;
-  if (S.plan && S.day === "today" && !todayTabAvailable()) S.day = "plan";
+  if (S.plan) await selectDay(dayOptions().includes(S.sel) || S.sel === isoDate(new Date()) ? S.sel : defaultDay(), false);
   const off = $("#offline");
   off.hidden = !servedFromCache;
   if (servedFromCache) off.textContent = "Offline: showing the plan saved on this device. Live readings and editing come back when the planner is reachable.";
@@ -97,9 +97,42 @@ async function loadStatus() {
 }
 
 /* ---------------------------------------------------------------- helpers */
-function planValues() { return S.plan.blocks_raw.map((b) => b.temperature); }
-function offOn() { return !!(S.plan && S.plan.lwt_offset && S.plan.lwt_offset.enabled && S.plan.blocks_raw[0] && "lwt_offset" in S.plan.blocks_raw[0]); }
-function planOffsets() { return offOn() ? S.plan.blocks_raw.map((b) => b.lwt_offset) : null; }
+/** The day shown in the Plan view and editor: the main plan, or a day fetched from /api/day. */
+function V() { return S.view || S.plan; }
+function planValues() { return V().blocks_raw.map((b) => b.temperature); }
+function offOn() { const v = V(); return !!(v && v.lwt_offset && v.lwt_offset.enabled && v.blocks_raw[0] && "lwt_offset" in v.blocks_raw[0]); }
+function planOffsets() { return offOn() ? V().blocks_raw.map((b) => b.lwt_offset) : null; }
+/** Days you can pick without the "Edit today's plan" button: future days only. */
+function dayOptions() {
+  const t = isoDate(new Date()), out = [];
+  if (S.plan.for_date > t) out.push(S.plan.for_date);
+  (S.plan.outlook || []).forEach((o) => { if (!o.error && o.date > t && !out.includes(o.date)) out.push(o.date); });
+  return out;
+}
+function defaultDay() { const o = dayOptions(); return o.length ? o[0] : S.plan.for_date; }
+async function selectDay(iso, redraw = true) {
+  S.sel = iso; S.edit = null; S.editOff = null; S.editRes = null;
+  if (iso === S.plan.for_date) S.view = null;
+  else {
+    try { const v = await api("/api/day?date=" + iso); S.view = v.kind === "plan" ? null : v; }
+    catch (e) { S.view = null; S.sel = S.plan.for_date; }
+  }
+  if (redraw) { renderDayPick(); renderHero(); renderEditor(); renderTimeline(); }
+}
+function renderDayPick() {
+  const t = isoDate(new Date()), opts = dayOptions().slice();
+  if (S.sel === t) opts.unshift(t);
+  const wk = {}; (S.plan.outlook || []).forEach((o) => (wk[o.date] = o));
+  const html = opts.map((iso) => {
+    const d = dateOf(iso), lab = iso === t ? "Today" : WD[wdIdx(d)] + " " + d.getDate();
+    const tag = iso === t ? "" : iso === S.plan.for_date ? "planned" : wk[iso] && wk[iso].edited ? "your edit" : "preview";
+    return '<button type="button" class="dp' + (iso === S.sel ? " on" : "") + '" data-day="' + iso + '" aria-pressed="' + (iso === S.sel) + '"><b>' + lab + "</b>" + (tag ? "<small>" + tag + "</small>" : "") + "</button>";
+  }).join("") + (S.sel === t ? '<button type="button" class="dp close" data-day="' + defaultDay() + '" aria-label="Back to the next day">✕</button>' : "");
+  document.querySelectorAll(".daypick").forEach((el) => {
+    el.innerHTML = html;
+    el.querySelectorAll("[data-day]").forEach((b) => b.addEventListener("click", () => selectDay(b.dataset.day).then(renderWeek)));
+  });
+}
 const sgn = (v) => (v > 0 ? "+" : v < 0 ? "−" : "±") + Math.abs(v);
 function offSummary(offs) {
   if (!offs) return "–";
@@ -110,14 +143,9 @@ function routineValues() { return S.plan.strategies["Current routine"].values; }
 function sameVals(a, b) { return a && b && a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < 1e-9); }
 /* ---- which day the editor is changing: the plan's day, or (after 22:00) the rest of today ---- */
 function todayIso() { return isoDate(new Date()); }
-function todayTabAvailable() { const p = S.plan; return !!(p && p.sim && p.sim.fixed && p.sim.start.slice(0, 10) === todayIso() && p.for_date !== todayIso()); }
-function editDate() { return S.day === "today" ? todayIso() : S.plan.for_date; }
-function baseVals() { return S.day === "today" ? S.plan.sim.fixed.map((b) => b[2]) : planValues(); }
-function baseOffs() {
-  if (!offOn()) return null;
-  if (S.day === "today") return S.plan.sim.fixed_off ? S.plan.sim.fixed_off.map((b) => b[2]) : planOffsets().map(() => 0);
-  return planOffsets();
-}
+function editDate() { return V().for_date; }
+function baseVals() { return planValues(); }
+function baseOffs() { return planOffsets(); }
 /** Blocks that have already ended on the day being edited (locked). */
 function lockedIdx() {
   const d = editDate(), t = todayIso();
@@ -127,7 +155,7 @@ function lockedIdx() {
   return new Set(S.cfg.blocks.map(([a, b], i) => (b <= h ? i : -1)).filter((i) => i >= 0));
 }
 function editing() { return !!(S.editRes && ((S.edit && !sameVals(S.edit, baseVals())) || (S.editOff && offOn() && !sameVals(S.editOff, baseOffs())))); }
-function chosenLabel() { return NAMES[S.plan.chosen] || S.plan.chosen; }
+function chosenLabel() { return NAMES[V().chosen] || V().chosen; }
 function isDark() { const t = document.documentElement.dataset.theme; return t ? t === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; }
 
 function seqColor(v) {
@@ -208,7 +236,7 @@ function render() {
   if (!S.plan) { $("#loading").textContent = "No plan yet. The first one is made at 22:00, or run “heatplanner.cli plan”."; return; }
   document.querySelectorAll(".sec").forEach((s) => (s.hidden = false));
   setTab(document.body.dataset.tab, false);
-  renderNow(); renderHero(); renderEditor(); renderStrategies(); renderWeek(); renderOcc(); renderModel(); renderHistory(); renderChips();
+  renderDayPick(); renderNow(); renderHero(); renderEditor(); renderStrategies(); renderWeek(); renderOcc(); renderModel(); renderHistory(); renderChips();
   drawCharts();
   $("#foot-entity").textContent = S.cfg.schedule_entity;
 }
@@ -280,22 +308,27 @@ function renderNow() {
     '<span class="d">' + (target != null ? "target " + deg(target) : "") + (diff != null ? ' · <span class="' + (Math.abs(diff) > 1 ? "up-bad" : "") + '">' + (Math.abs(diff) < 0.15 ? "as predicted" : Math.abs(diff).toFixed(1) + "° " + (diff > 0 ? "warmer" : "cooler") + " than predicted") + "</span>" : "") + "</span></div>" +
     '<div class="now-next"><span class="k">Next change</span>' + (nextB ? '<span class="nx"><b>' + nextWhen + "</b> → <b>" + deg(nextB.temperature) + '</b></span><span class="tag ' + tariff(nextB.from).slot + '">' + tariff(nextB.from).label + "</span>" : '<span class="nx">None today</span>') + "</div></div>" +
     strip24 + '<div class="facts">' + facts.join("") + "</div>" +
-    (st.available === false ? '<p class="foot">Live readings unavailable: ' + esc(st.error || "") + "</p>" : "");
+    (st.available === false ? '<p class="foot">Live readings unavailable: ' + esc(st.error || "") + "</p>" : "") +
+    '<div class="now-actions"><button type="button" class="btn ghost" id="edit-today">Edit today\'s plan</button></div>';
+  const et = $("#edit-today");
+  et.hidden = !(p.for_date === todayIso() || (p.sim && p.sim.start.slice(0, 10) === todayIso()));
+  et.onclick = async () => { await selectDay(todayIso()); renderWeek(); if (MOBILE()) { history.replaceState(null, "", "#plan"); setTab("plan"); } else $("#plan").scrollIntoView(); };
 }
 
 /* ---------------------------------------------------------------- hero */
 function renderHero() {
-  const p = S.plan, d = dateOf(p.for_date);
+  const p = V(), d = dateOf(p.for_date);
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const rel = Math.round((d - today) / 864e5);
   const when = rel === 0 ? "Today" : rel === 1 ? "Tomorrow" : rel === -1 ? "Yesterday" : WDL[wdIdx(d)];
   const ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
   const fc = p.forecast_tomorrow;
-  $("#hero-eyebrow").innerHTML = "<span>" + when + "'s plan · " + fmtDate(d) + "</span>" + '<span class="tag">' + deg(fc.min, 0) + " to " + deg(fc.max, 0) + " outside</span>" +
+  $("#hero-eyebrow").innerHTML = "<span>" + (p.kind === "outlook" ? "Preview · " + fmtDate(d) : when + "'s plan · " + fmtDate(d)) + "</span>" + '<span class="tag">' + deg(fc.min, 0) + " to " + deg(fc.max, 0) + " outside</span>" +
     '<span class="tag">' + ({ home: "Home all day", away_day: "Out " + rng(S.cfg.occupancy.away_from, S.cfg.occupancy.away_to), away_all: "Away all day" }[p.occupancy?.status_tomorrow] || "") + "</span>";
   let title, why = "";
   const money = cur.grid_cost - ch.grid_cost, comfort = cur.penalty - ch.penalty;
-  if (p.chosen === "Current routine") { title = "Your routine is already the best plan"; why = "Nothing beat it by more than 2p, so the planner kept your usual setpoints."; }
+  if (p.kind === "today_tail") { title = "The rest of today"; why = "Tonight's remaining setpoints. Tomorrow's plan is shown on its own day."; }
+  else if (p.chosen === "Current routine") { title = "Your routine is already the best plan"; why = "Nothing beat it by more than 2p, so the planner kept your usual setpoints."; }
   else if (p.chosen === "Your edit") { title = "Running your edited plan"; why = "Pushed by hand at " + esc((p.manual?.at || "").slice(11, 16)) + ". " + (money >= 0.01 ? "About " + gbp(money) + " less electricity than your routine. " : money <= -0.01 ? "About " + gbp(-money) + " more electricity than your routine. " : "") + "Tonight's 22:00 run plans the next day as normal."; }
   else {
     if (money >= 0.01) title = "Saves about " + gbp(money) + " on electricity" + (comfort > 0.05 ? " and keeps you warmer" : "");
@@ -304,6 +337,7 @@ function renderHero() {
     const ex = explain(ch.values, cur.values, ch.offsets, cur.offsets);
     why = ex.length ? "It " + joinAnd(ex.slice(0, 4)) + "." : "";
     const sp = p.strategies["Setpoints only (offset unchanged, for reference)"];
+    if (p.note && p.kind === "outlook") why += " " + p.note;
     if (sp && sp.grid_cost - ch.grid_cost >= 0.01) why += " Planning the water temperature as well cuts electricity by " + gbp(sp.grid_cost - ch.grid_cost) + " compared with changing setpoints alone.";
     if (comfort > 0.05 && cur.hours_below != null) why += " Your routine would leave the room " + comfortText(cur) + ".";
     else if (comfort > 0.05) why += " Your routine would let the room fall below the comfort floor while you're home.";
@@ -321,7 +355,7 @@ function renderHero() {
 /* ---------------------------------------------------------------- timeline (small multiples, shared x) */
 function renderTimeline() {
   const box = $("#timeline");
-  const p = S.plan, rows = p.trace_best || [];
+  const p = V(), rows = p.trace_best || [];
   if (!box.offsetParent) return; // hidden tab: drawn when shown
   if (!rows.length) { box.innerHTML = '<p class="foot">No trace stored with this plan.</p>'; return; }
   const cur = p.trace_current || [];
@@ -456,8 +490,8 @@ function renderTimeline() {
   o.push('<rect id="tl-hit" x="' + L + '" y="0" width="' + (W - L - R) + '" height="' + H + '" fill="transparent"/>');
 
   // ---- drag handles: one per block of the planned day
-  const vals = S.day === "plan" && S.edit ? S.edit : planValues(), base = planValues();
-  const lockedH = S.day === "plan" ? lockedIdx() : new Set(S.cfg.blocks.map((_, i) => i));
+  const vals = S.edit || planValues(), base = planValues();
+  const lockedH = lockedIdx();
   const blockSpan = [];
   S.cfg.blocks.forEach(([a, b], bi) => {
     let i0 = -1, i1 = -1;
@@ -534,26 +568,19 @@ function renderTimeline() {
 /* ---------------------------------------------------------------- editor */
 let simTimer = null, simSeq = 0;
 function renderEditor() {
-  const p = S.plan, base = baseVals(), vals = S.edit || base, c = S.cfg.comfort;
+  const p = V(), base = baseVals(), vals = S.edit || base, c = S.cfg.comfort;
   const oOn = offOn(), baseO = baseOffs(), offs = S.editOff || baseO, oc = p.lwt_offset || {};
   const d = dateOf(editDate()), locked = lockedIdx(), isToday = editDate() === todayIso();
-  $("#ed-reset").textContent = S.day === "today" ? "Reset" : "Reset to plan";
-  // day switch: only when the plan is already for tomorrow and today still has time left
-  const dt = $("#ed-day");
-  dt.hidden = !todayTabAvailable();
-  if (!dt.hidden) {
-    dt.innerHTML = [["today", "Today"], ["plan", "Tomorrow"]].map(([k, l]) => '<label><input type="radio" name="edday" value="' + k + '"' + (S.day === k ? " checked" : "") + "><span>" + l + "</span></label>").join("");
-    dt.querySelectorAll("input").forEach((r) => r.addEventListener("change", () => { S.day = r.value; S.edit = null; S.editOff = null; S.editRes = null; renderEditor(); renderTimeline(); }));
-  }
+  $("#ed-reset").textContent = p.kind === "today_tail" ? "Reset" : "Reset to plan";
   $("#edit-sub").innerHTML = "Nothing goes to Home Assistant until you press Push. Editing <b>" + (isToday ? "today, " : "") + fmtDate(d) + "</b>" +
     (locked.size && locked.size < S.cfg.blocks.length ? "; blocks that have already ended are locked." : ".") +
-    (S.day === "today" ? " Tomorrow's plan is left as it is." : "") +
+    (p.kind === "today_tail" ? " Tomorrow's plan is left as it is." : p.kind === "outlook" ? " This is a week-ahead preview; pushing pins your edit so the 22:00 run the night before keeps it." : "") +
     (oOn ? " <b>Water</b> is the leaving-water offset: lower means cooler radiators and a better COP, but slower heating." : "");
   const un = $("#undo");
   const prev = p.manual && p.manual.previous;
   un.hidden = !(p.chosen === "Your edit" && prev);
   if (!un.hidden) {
-    un.innerHTML = "<span>You're running your own edit, pushed at <b>" + esc((p.manual.at || "").slice(11, 16)) + "</b>.</span>" + '<button type="button" class="btn ghost" id="undo-btn">Undo: back to ' + esc(NAMES[prev] || prev) + "</button>";
+    un.innerHTML = "<span>" + (p.kind === "outlook" ? "Your edit is pinned to this day" : "You're running your own edit") + ", pushed <b>" + esc((p.manual.at || "").replace("T", " ").slice(5, 16)) + "</b>.</span>" + '<button type="button" class="btn ghost" id="undo-btn">Undo: back to ' + esc(NAMES[prev] || prev) + "</button>";
     $("#undo-btn").onclick = undoEdit;
   }
   const ed = $("#editor");
@@ -599,17 +626,14 @@ function setEdit(values, offsets) {
     renderTimeline(); renderEdSummary();
   }, 200);
 }
-/** Request body for simulate/push: today-edits keep the plan's own day as it is. */
+/** Request body for simulate/push: the server works out which kind of day the date is. */
 function simBody(values, offs) {
-  if (S.day === "today") {
-    const b = { day: "today", values: planValues(), today_values: values };
-    if (offOn()) { b.offsets = planOffsets(); b.today_offsets = offs; }
-    return b;
-  }
-  return offOn() ? { values, offsets: offs } : { values };
+  const b = { date: editDate(), values };
+  if (offOn()) b.offsets = offs;
+  return b;
 }
 function renderEdSummary() {
-  const p = S.plan, ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
+  const p = V(), ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
   const e = editing(), r = e ? S.editRes : ch;
   const vsPlan = (a, b, unit) => { if (!e) return ""; const d = a - b; if (Math.abs(d) < 0.005) return '<span class="d">same as plan</span>'; return '<span class="d ' + (d < 0 ? "up-good" : "up-bad") + '">' + (d < 0 ? "▼ " : "▲ ") + (unit ? Math.abs(d).toFixed(1) + " " + unit : gbp(Math.abs(d))) + (d < 0 ? " less" : " more") + " than plan</span>"; };
   const dg = r.grid_cost - cur.grid_cost;
@@ -627,11 +651,11 @@ function renderEdSummary() {
   $("#ed-push").title = past ? "This plan's day has passed. Re-run the optimiser first." : e ? "" : "Change a setpoint first";
 }
 async function undoEdit() {
-  const p = S.plan, prev = p.manual.previous, vals = p.strategies[prev].values, offs = p.strategies[prev].offsets || null;
+  const p = V(), prev = p.manual.previous, vals = p.strategies[prev].values, offs = p.strategies[prev].offsets || null;
   const body = "<p>This puts the planner's <b>" + esc(NAMES[prev] || prev) + "</b> plan back into <code>" + esc(S.cfg.schedule_entity) + "</code> for " + WDL[wdIdx(dateOf(p.for_date))] + ".</p>" + strip(tidy(vals, offs));
   if (!(await confirmDlg("Undo your edit?", body, "Undo"))) return;
   const m = $("#ed-msg"); m.className = "msg"; m.textContent = "Restoring…";
-  try { const r = await api("/api/restore", {}); await loadAll(); $("#ed-msg").className = "msg " + (r.pushed.verified ? "ok" : "err"); $("#ed-msg").textContent = r.pushed.verified ? "Restored and verified." : "Restored, but the read-back did not match."; }
+  try { const r = await api("/api/restore", { date: editDate() }); await loadAll(); $("#ed-msg").className = "msg " + (r.pushed.verified ? "ok" : "err"); $("#ed-msg").textContent = r.pushed.verified ? "Restored and verified." : "Restored, but the read-back did not match."; }
   catch (e) { m.className = "msg err"; m.textContent = e.message; }
 }
 function wireEditor() {
@@ -643,9 +667,9 @@ function wireEditor() {
   };
   $("#ed-rerun").onclick = () => rerun("/api/rerun", {}, $("#ed-msg"));
   $("#ed-push").onclick = async () => {
-    const vals = S.edit || baseVals(), offs = offOn() ? S.editOff || baseOffs() : null, p = S.plan;
+    const vals = S.edit || baseVals(), offs = offOn() ? S.editOff || baseOffs() : null, p = V();
     const blocks = tidy(vals, offs).filter((b) => b.to > (editDate() === todayIso() ? nowH() : 0));
-    const body = "<p>This writes " + (editDate() === todayIso() ? "the rest of <b>today</b>" : "<b>" + WDL[wdIdx(dateOf(editDate()))] + "</b>") + " in <code>" + esc(S.cfg.schedule_entity) + "</code>. Your live schedule is not touched" + (S.day === "today" ? ", and tomorrow's plan stays as it is." : ", and you can undo it afterwards.") + "</p>" +
+    const body = "<p>This writes " + (editDate() === todayIso() ? "the rest of <b>today</b>" : "<b>" + WDL[wdIdx(dateOf(editDate()))] + "</b>") + " in <code>" + esc(S.cfg.schedule_entity) + "</code>. Your live schedule is not touched" + (p.kind === "today_tail" ? ", and tomorrow's plan stays as it is." : p.kind === "outlook" ? ". The edit is pinned, so the 22:00 run the night before keeps it; you can undo it." : ", and you can undo it afterwards.") + "</p>" +
       strip(blocks) + '<p style="font-variant-numeric:tabular-nums">' + blocks.map((b) => rng(b.from, b.to) + " " + b.temperature.toFixed(1) + "°" + (b.lwt_offset !== undefined ? " (water " + sgn(b.lwt_offset) + ")" : "")).join(" · ") + "</p>";
     if (!(await confirmDlg("Push your edited plan?", body, "Push"))) return;
     const m = $("#ed-msg"); m.className = "msg"; m.textContent = "Pushing…";
@@ -685,8 +709,8 @@ function renderStrategies() {
   }).join("");
   document.querySelectorAll("[data-try]").forEach((b) => b.addEventListener("click", () => {
     const st = p.strategies[b.dataset.try];
-    S.day = "plan";
-    setEdit(st.values.slice(), st.offsets ? st.offsets.slice() : null);
+    const go = () => setEdit(st.values.slice(), st.offsets ? st.offsets.slice() : null);
+    if (S.view) selectDay(S.plan.for_date).then(go); else go();
     if (MOBILE()) setTab("plan"); else $("#edit").scrollIntoView();
   }));
 }
@@ -724,15 +748,19 @@ function renderWeek() {
   const stLabel = (s) => ({ home: "Home all day", away_day: "Out " + rng(occ.away_from, occ.away_to), away_all: "Away all day" }[s] || s);
   const ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
   const cards = [{ date: p.for_date, status: p.occupancy?.status_tomorrow, mean: p.forecast_tomorrow.mean, grid: ch.grid_cost, curGrid: cur.grid_cost, hb: ch.hours_below, pen: ch.penalty, blocks: p.blocks, kwh: ch.kwh_hp, first: true }]
-    .concat((p.outlook || []).filter((o) => !o.error).map((o) => ({ date: o.date, status: o.status, mean: o.forecast_mean, grid: o.grid_cost, curGrid: o.current_grid_cost, hb: o.hours_below, pen: o.penalty, blocks: o.blocks, kwh: o.kwh_hp })));
+    .concat((p.outlook || []).filter((o) => !o.error).map((o) => ({ date: o.date, status: o.status, mean: o.forecast_mean, grid: o.grid_cost, curGrid: o.current_grid_cost, hb: o.hours_below, pen: o.penalty, blocks: o.blocks, kwh: o.kwh_hp, edited: o.edited })));
   $("#week-cards").innerHTML = cards.map((c) => {
     const d = dateOf(c.date);
     const delta = c.curGrid != null ? (Math.abs(c.curGrid - c.grid) < 0.005 ? '<div class="meta">Same as routine</div>' : '<div class="meta ' + (c.grid < c.curGrid ? "up-good" : "up-bad") + '">' + (c.grid < c.curGrid ? "▼ " + gbp(c.curGrid - c.grid) + " less" : "▲ " + gbp(c.grid - c.curGrid) + " more") + " than routine</div>") : "";
-    return '<div class="day' + (c.first ? " first" : "") + '"><div class="dn">' + WD[wdIdx(d)] + " " + d.getDate() + "<span>" + deg(c.mean, 0) + "</span></div>" +
+    return '<button type="button" class="day' + (c.date === S.sel ? " first" : "") + '" data-day="' + c.date + '" aria-label="Open ' + fmtDate(d) + '"><div class="dn">' + WD[wdIdx(d)] + " " + d.getDate() + "<span>" + deg(c.mean, 0) + "</span></div>" +
       '<div class="meta">' + esc(stLabel(c.status)) + (c.first ? ' · <b class="pushed">pushed</b>' : "") + "</div>" +
       '<div class="cost">' + gbp(c.grid) + "<small> electricity</small></div>" + delta +
-      strip(c.blocks, false) + '<div class="meta">' + (c.kwh != null ? Math.round(c.kwh) + " kWh pump · " : "") + comfortText({ hours_below: c.hb, penalty: c.pen }, true).toLowerCase() + "</div></div>";
+      strip(c.blocks, false) + '<div class="meta">' + (c.kwh != null ? Math.round(c.kwh) + " kWh pump · " : "") + comfortText({ hours_below: c.hb, penalty: c.pen }, true).toLowerCase() + (c.edited ? ' · <b class="pushed">your edit</b>' : "") + "</div></button>";
   }).join("");
+  document.querySelectorAll("#week-cards [data-day]").forEach((b) => b.addEventListener("click", async () => {
+    await selectDay(b.dataset.day); renderWeek();
+    if (MOBILE()) { history.replaceState(null, "", "#plan"); setTab("plan"); } else $("#plan").scrollIntoView();
+  }));
   $("#sp-scale").innerHTML = "<span>Setpoint</span><span>16°</span><span class='ramp' style='background:linear-gradient(90deg," + seqColor(16).bg + "," + seqColor(22).bg + ")'></span><span>22°</span><span>· electricity for each 30 h window incl. house load</span>";
 }
 

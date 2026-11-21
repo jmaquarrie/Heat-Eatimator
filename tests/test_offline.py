@@ -35,7 +35,8 @@ class Offline(unittest.TestCase):
 
     def test_simulate_matches_stored_plan(self):
         for name in ("Optimised", "Current routine"):
-            r = planner.simulate_values(self.cfg, self.plan, self.plan["strategies"][name]["values"])
+            st = self.plan["strategies"][name]
+            r = planner.simulate_values(self.cfg, self.plan, st["values"], st.get("offsets"))
             self.assertAlmostEqual(r["total"], self.plan["strategies"][name]["total"], places=6)
             self.assertTrue(r["exact"])
 
@@ -72,6 +73,43 @@ class Offline(unittest.TestCase):
         with self.assertRaises(ValueError):
             planner.restore_plan(ha, self.cfg, back)
         data.save_json("plan_latest.json", self.plan)
+
+    def test_offsets_planned_pushed_and_bounded(self):
+        opt = self.plan["strategies"]["Optimised"]
+        self.assertEqual(len(opt["offsets"]), len(self.cfg["blocks"]))
+        ref = self.plan["strategies"]["Setpoints only (offset unchanged, for reference)"]
+        self.assertLessEqual(opt["total"], ref["total"] + 1e-9)          # tuning offsets can only help the score
+        self.assertTrue(all(-5 <= o <= 5 for o in opt["offsets"]))
+        with self.assertRaises(ValueError):
+            planner.simulate_values(self.cfg, self.plan, opt["values"], [0, 0, -8, 0, 0, 0, 0])
+        ha = self.fake()
+        new = planner.push_values(ha, self.cfg, self.plan, opt["values"], [-3, -3, -3, 0, 0, 0, 0])
+        day = ha.helper[new["weekday"]]
+        self.assertEqual(day[0]["data"].get("lwt_offset"), -3)
+        self.assertTrue(all("lwt_offset" in b["data"] for b in day))
+        data.save_json("plan_latest.json", self.plan)
+
+    def test_lower_offset_raises_cop_and_caps_output(self):
+        from heatplanner import model
+        p = model.DEFAULT_PARAMS
+        self.assertGreater(model.cop_lwt(p, 5, model.lwt_curve(p, 5) - 3), model.cop_lwt(p, 5, model.lwt_curve(p, 5)))
+        self.assertLess(model.emitter_max(p, 30, 20), model.emitter_max(p, 35, 20))
+
+    def test_learn_fits_weather_curve_and_radiators(self):
+        from heatplanner import learn, model
+        rows = []
+        for i in range(200):
+            to = -2 + (i % 12)
+            lwt = 38.0 - 0.6 * to
+            room = 20.0
+            q = 0.9 * (lwt - 2.5 - room)                        # true k_emit 0.9
+            cop = model.cop_published(to, lwt)
+            rows.append({"ts": "2026-11-%02dT%02d:%02d:00+00:00" % (1 + i // 48, (i % 48) // 2, 30 * (i % 2)),
+                         "outdoor": to, "lwt": lwt, "room": room, "heating": 1.0, "heat_kwh": q / cop / 2, "cop": cop, "target": 20})
+        new, notes, info = learn.fit(rows)
+        self.assertLess(abs(new["lwc_b"] - (0.5 * -0.55 + 0.5 * -0.6)), 0.05)   # blended with prior at weight 50%
+        self.assertGreater(new["k_emit_kw_per_k"], 0.9)                           # pulled from prior 1.0 toward 0.9..
+        self.assertLess(new["k_emit_kw_per_k"], 1.0)
 
     def test_comfort_hours_and_grid_meter(self):
         for r in self.plan["strategies"].values():

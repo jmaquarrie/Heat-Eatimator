@@ -172,6 +172,35 @@ def fit(rows):
     if len(d) >= 96:
         info["outdoor_bias_raw"] = round(st.mean(d), 2)
         new["outdoor_bias_c"] = round(max(-3.0, min(3.0, st.mean(d))), 2)
+    # ---- weather curve and radiator output (used when the leaving-water offset is planned)
+    run = [r for r in rows if (r.get("heating") or 0) >= 0.8 and r.get("lwt") and r.get("outdoor") is not None
+           and r.get("room") is not None and r["lwt"] > 22]
+    info["lwt_rows"] = len(run)
+    if len(run) >= 40:
+        xs = [r["outdoor"] for r in run]
+        ys = [r["lwt"] - (r.get("lwt_offset") or 0.0) for r in run]
+        f = ols(xs, ys)
+        if f and -1.2 < f[1] < -0.1 and 25 < f[0] < 50 and f[2] > 0.2:
+            w = min(0.8, len(run) / 400)
+            new["lwc_a"], new["lwc_b"] = round(blend(PRIOR["lwc_a"], f[0], w), 2), round(blend(PRIOR["lwc_b"], f[1], w), 3)
+            notes.append("weather curve fitted: LWT = %.1f %+.2f x outdoor (r2 %.2f, %d running half-hours, weight %.0f%%)" % (f[0], f[1], f[2], len(run), 100 * w))
+        elif f:
+            notes.append("weather-curve fit rejected (a=%.1f b=%.2f r2=%.2f); kept prior" % f)
+        ks = []
+        for r in run:
+            dT = r["lwt"] - 2.5 - r["room"]
+            if dT > 3 and (r.get("heat_kwh") or 0) > 0.05:
+                ks.append(r["heat_kwh"] * 2 * row_cop(new, r) / r["heating"] / dT)
+        if len(ks) >= 30:
+            k = st.median(ks)
+            if 0.3 < k < 3.0:
+                w = min(0.8, len(ks) / 300)
+                new["k_emit_kw_per_k"] = round(blend(PRIOR["k_emit_kw_per_k"], k, w), 3)
+                notes.append("radiator output fitted: %.2f kW per K (median of %d, weight %.0f%%)" % (k, len(ks), 100 * w))
+            else:
+                notes.append("radiator-output fit rejected (k=%.2f); kept prior" % k)
+    else:
+        notes.append("only %d running half-hours with LWT data; weather curve and radiator output kept at prior" % len(run))
     return new, notes, info
 
 
@@ -205,10 +234,12 @@ def backtest(cfg, params, rows, max_days=14):
             by_hour[local_dt(r["ts"]).hour].append(r)
         if len(by_hour) < 24:
             continue
-        blocks = []
+        blocks, offs = [], []
         for h in range(24):
             tg = [r["target"] for r in by_hour[h] if r["target"] is not None]
             blocks.append((h, h + 1, st.mean(tg) if tg else 18.0))
+            of = [r["lwt_offset"] for r in by_hour[h] if r.get("lwt_offset") is not None]
+            offs.append((h, h + 1, round(st.mean(of)) if of else 0))
         pts = sorted((local_dt(r["ts"]), r["outdoor"]) for r in v if r["outdoor"] is not None)
         rad_pts = sorted((local_dt(r["ts"]), r["rad"]) for r in v if r.get("rad") is not None)
         room0 = next((r["room"] for r in v if r["room"] is not None), 19.5)
@@ -216,7 +247,10 @@ def backtest(cfg, params, rows, max_days=14):
                "soc0_kwh": 0, "outdoor": data.series_fn(pts), "tomorrow": d + dt.timedelta(days=1), "terminal_ref_c": 19.5}
         if len(rad_pts) > 40:
             ctx["radiation"] = data.series_fn(rad_pts)
-        res = model.simulate(cfg, params, {"fixed": blocks, "day": blocks}, ctx, use_battery=False, trace=True)
+        plan = {"fixed": blocks, "day": blocks}
+        if cfg.get("lwt_offset", {}).get("enabled"):   # backtest in the same mode the planner plans in
+            plan.update({"fixed_off": offs, "day_off": offs})
+        res = model.simulate(cfg, params, plan, ctx, use_battery=False, trace=True)
         actual_kwh = sum(r["heat_kwh"] for r in v)
         act_room = {}
         for r in v:
@@ -251,7 +285,8 @@ def run_learn(cfg, ha=None):
         new = saved
     hist = prev.get("history", [])
     hist.append({"at": dt.datetime.now(LOCAL).isoformat(timespec="seconds"), "accepted": accepted,
-                 "params": {k: new[k] for k in ("ua_kw_per_k", "gains_kw", "gains_solar", "c_kwh_per_k", "outdoor_bias_c")},
+                 "params": {k: new[k] for k in ("ua_kw_per_k", "gains_kw", "gains_solar", "c_kwh_per_k", "outdoor_bias_c",
+                                                 "lwc_a", "lwc_b", "k_emit_kw_per_k")},
                  "mae_kwh_prev": so, "mae_kwh_new": sn, "days_used": info["days_used"]})
     data.save_json("params.json", {"params": new, "fitted_at": hist[-1]["at"], "info": info, "notes": notes,
                                    "backtest": backtest(cfg, new, rows), "history": hist[-60:]})

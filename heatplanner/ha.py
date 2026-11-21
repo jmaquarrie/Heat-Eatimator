@@ -25,6 +25,12 @@ class HA:
         r = self.rest("/api/history/period/%s?%s" % (urllib.parse.quote(start_iso), urllib.parse.urlencode(q)), timeout=180)
         return [(p["last_changed"], p["state"]) for p in r[0]] if r else []
 
+    def history_attr(self, entity_id, start_iso, end_iso, attr):
+        """History of one attribute (e.g. a climate entity's target temperature)."""
+        q = {"filter_entity_id": entity_id, "end_time": end_iso}
+        r = self.rest("/api/history/period/%s?%s" % (urllib.parse.quote(start_iso), urllib.parse.urlencode(q)), timeout=180)
+        return [(p["last_changed"], (p.get("attributes") or {}).get(attr)) for p in r[0]] if r else []
+
     # ---- websocket (a short-lived connection per batch of commands) ----
     def ws_commands(self, commands, timeout=30):
         u = urllib.parse.urlparse(self.url)

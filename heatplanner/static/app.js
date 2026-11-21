@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editRes: null, actuals: null, occ: null };
+const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editOff: null, editRes: null, actuals: null, occ: null };
 const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const WDL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -82,7 +82,7 @@ async function loadAll() {
   servedFromCache = null;
   const [plan, params, idx, cfg, log] = await Promise.all(["/api/plan", "/api/params", "/api/plans", "/api/config", "/api/log"].map((p) => api(p).catch(() => null)));
   S.plan = plan && plan.for_date ? plan : null; S.params = params || {}; S.idx = idx || []; S.cfg = cfg; S.log = log || [];
-  S.edit = null; S.editRes = null; S.occ = null;
+  S.edit = null; S.editOff = null; S.editRes = null; S.occ = null;
   const off = $("#offline");
   off.hidden = !servedFromCache;
   if (servedFromCache) off.textContent = "Offline: showing the plan saved on this device. Live readings and editing come back when the planner is reachable.";
@@ -97,9 +97,17 @@ async function loadStatus() {
 
 /* ---------------------------------------------------------------- helpers */
 function planValues() { return S.plan.blocks_raw.map((b) => b.temperature); }
+function offOn() { return !!(S.plan && S.plan.lwt_offset && S.plan.lwt_offset.enabled && S.plan.blocks_raw[0] && "lwt_offset" in S.plan.blocks_raw[0]); }
+function planOffsets() { return offOn() ? S.plan.blocks_raw.map((b) => b.lwt_offset) : null; }
+const sgn = (v) => (v > 0 ? "+" : v < 0 ? "−" : "±") + Math.abs(v);
+function offSummary(offs) {
+  if (!offs) return "–";
+  const lo = Math.min(...offs), hi = Math.max(...offs);
+  return lo === hi ? sgn(lo) + " all day" : sgn(lo) + " to " + sgn(hi);
+}
 function routineValues() { return S.plan.strategies["Current routine"].values; }
 function sameVals(a, b) { return a && b && a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < 1e-9); }
-function editing() { return S.edit && S.editRes && !sameVals(S.edit, planValues()); }
+function editing() { return !!(S.editRes && ((S.edit && !sameVals(S.edit, planValues())) || (S.editOff && offOn() && !sameVals(S.editOff, planOffsets())))); }
 function chosenLabel() { return NAMES[S.plan.chosen] || S.plan.chosen; }
 function isDark() { const t = document.documentElement.dataset.theme; return t ? t === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; }
 
@@ -116,9 +124,13 @@ function strip(blocks, labels = true) {
   return '<div class="strip" role="img" aria-label="' + esc(blocks.map((b) => rng(b.from, b.to) + " " + b.temperature + "°").join(", ")) + '">' +
     blocks.map((b) => { const c = seqColor(b.temperature); return '<div class="' + (c.lite ? "lite" : "") + '" style="flex:' + (b.to - b.from) + ";background:" + c.bg + '" title="' + rng(b.from, b.to) + " " + b.temperature + '°">' + (labels && b.to - b.from >= 3 ? b.temperature : "") + "</div>"; }).join("") + "</div>";
 }
-function tidy(values) {
+function tidy(values, offs) {
   const out = [];
-  S.cfg.blocks.forEach(([a, b], i) => { const v = values[i]; if (out.length && out[out.length - 1].temperature === v) out[out.length - 1].to = b; else out.push({ from: a, to: b, temperature: v }); });
+  S.cfg.blocks.forEach(([a, b], i) => {
+    const v = values[i], o = offs ? offs[i] : undefined, last = out[out.length - 1];
+    if (last && last.temperature === v && last.lwt_offset === o) last.to = b;
+    else out.push(o === undefined ? { from: a, to: b, temperature: v } : { from: a, to: b, temperature: v, lwt_offset: o });
+  });
   return out;
 }
 function mergeBlocks(bs) {
@@ -135,8 +147,15 @@ function todayBlocks() {
 }
 
 /** Plain-English reasons a strategy differs from the routine. */
-function explain(vals, base) {
-  const parts = [];
+function explain(vals, base, offs, baseOffs) {
+  const parts = [], oparts = [];
+  if (offs && baseOffs) {
+    // group consecutive blocks with the same offset change
+    let run = null;
+    const flush = () => { if (run) { oparts.push("runs the water " + Math.abs(run.d) + "° " + (run.d < 0 ? "cooler" : "hotter") + " " + rng(run.a, run.b)); run = null; } };
+    S.cfg.blocks.forEach(([a, b], i) => { const d = offs[i] - baseOffs[i]; if (!d) { flush(); return; } if (run && run.d === d && run.b === a) run.b = b; else { flush(); run = { a, b, d }; } });
+    flush();
+  }
   S.cfg.blocks.forEach(([a, b], i) => {
     const d = vals[i] - base[i];
     if (Math.abs(d) < 0.25) return;
@@ -144,7 +163,7 @@ function explain(vals, base) {
     if (d > 0) parts.push(t.slot === "cosy" ? "pre-heats to " + w + " while power is cheap" : "runs warmer at " + w);
     else parts.push(t.slot === "peak" ? "eases off to " + w + " through the peak" : "runs cooler at " + w);
   });
-  return parts;
+  return parts.concat(oparts);
 }
 const joinAnd = (a) => (a.length > 1 ? a.slice(0, -1).join(", ") + " and " + a[a.length - 1] : a[0] || "");
 
@@ -194,6 +213,7 @@ function renderChips() {
     if (st.following === true) out.push(chip("good", "Heat pump <b>following plan</b>", "Thermostat setpoint matches the planner helper"));
     else if (st.following === false) out.push(chip("warn", "Pump at <b>" + deg(st.climate.setpoint) + "</b>, plan <b>" + deg(st.helper.temperature) + "</b>", "Expected until the HA automation linking the helper to the thermostat is in place"));
     else out.push(chip("", "Pump link: not set up yet"));
+    if (offOn() && st.offset_following === false) out.push(chip("warn", "Offset at <b>" + sgn(st.offset.value) + "</b>, plan <b>" + sgn(st.helper.lwt_offset) + "</b>", "Expected until the offset automation is in place"));
     if (st.api_budget != null) out.push(chip(st.api_budget < 15 ? "warn" : "", "Daikin API left <b>" + Math.round(st.api_budget) + "</b>", "Daikin cloud calls left today (about 200 a day)"));
     if (st.grid_w != null) out.push(chip("", (st.grid_w >= 0 ? "Grid importing <b>" : "Grid exporting <b>") + (Math.abs(st.grid_w) / 1000).toFixed(2) + " kW</b>"));
   }
@@ -225,8 +245,14 @@ function renderNow() {
   const diff = room != null && pred != null ? room - pred : null;
   const facts = [];
   facts.push('<div class="fact"><span>Tariff now</span><b><span class="tag ' + tf.slot + '">' + tf.label + " " + pence(tf.rate) + "</span></b><small>" + nt.label + " from " + hh(nh % 24) + "</small></div>");
+  const orr = Object.entries(st.other_rooms || {});
+  if (orr.length) facts.push('<div class="fact"><span>Rest of house</span><b>' + orr.map(([, v]) => deg(v)).join(" / ") + "</b><small>" + orr.map(([k]) => k).join(" / ") + "</small></div>");
   if (st.battery_pct != null) facts.push('<div class="fact"><span>Battery</span><b>' + Math.round(st.battery_pct) + "%</b><small>" + (S.cfg.battery.capacity_kwh * st.battery_pct / 100).toFixed(1) + " kWh</small></div>");
   if (st.outdoor != null) facts.push('<div class="fact"><span>Outside</span><b>' + deg(st.outdoor) + "</b><small>" + deg(p.forecast_tomorrow.min, 0) + " to " + deg(p.forecast_tomorrow.max, 0) + " on plan day</small></div>");
+  if (offOn() || (st.offset && st.offset.value != null)) {
+    const pv = st.helper && st.helper.lwt_offset != null ? st.helper.lwt_offset : curB && curB.lwt_offset != null ? curB.lwt_offset : null;
+    facts.push('<div class="fact"><span>Water offset</span><b>' + (st.offset && st.offset.value != null ? sgn(st.offset.value) + "°" : "–") + "</b><small>" + (pv != null ? "plan " + sgn(pv) + "°" : "") + (st.offset && st.offset.lwt != null ? " · water " + deg(st.offset.lwt) : "") + "</small></div>");
+  }
   if (st.heating) facts.push('<div class="fact"><span>Heating</span><b>' + (st.heating === "on" ? "Running" : "Idle") + "</b><small>" + (st.following === true ? "following plan" : st.following === false ? "not following plan" : "pump link not set") + "</small></div>");
   let strip24 = "";
   if (tb) strip24 = '<div class="today"><div class="mini-title">Today\'s setpoints</div><div class="today-strip">' + strip(tb) + '<i class="now-mark" style="left:' + (h / 24 * 100).toFixed(2) + '%"></i></div><div class="today-ax"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div></div>';
@@ -256,8 +282,10 @@ function renderHero() {
     if (money >= 0.01) title = "Saves about " + gbp(money) + " on electricity" + (comfort > 0.05 ? " and keeps you warmer" : "");
     else if (comfort > 0.05) title = "Keeps you warmer than your routine for " + gbp(-money) + " more";
     else title = "A slightly better day than your routine";
-    const ex = explain(ch.values, cur.values);
-    why = ex.length ? "It " + joinAnd(ex.slice(0, 3)) + "." : "";
+    const ex = explain(ch.values, cur.values, ch.offsets, cur.offsets);
+    why = ex.length ? "It " + joinAnd(ex.slice(0, 4)) + "." : "";
+    const sp = p.strategies["Setpoints only (offset unchanged, for reference)"];
+    if (sp && sp.grid_cost - ch.grid_cost >= 0.01) why += " Planning the water temperature as well cuts electricity by " + gbp(sp.grid_cost - ch.grid_cost) + " compared with changing setpoints alone.";
     if (comfort > 0.05 && cur.hours_below != null) why += " Your routine would leave the room " + comfortText(cur) + ".";
     else if (comfort > 0.05) why += " Your routine would let the room fall below the comfort floor while you're home.";
   }
@@ -285,6 +313,7 @@ function renderTimeline() {
   const L = narrow ? 30 : 42, R = narrow ? 44 : 64;
   const lanes = [
     { id: "room", title: "Room °C", h: narrow ? 210 : 260 },
+    ...(rows[0].lwt != null ? [{ id: "lwt", title: "Water temperature °C (target while running)", h: 62 }] : []),
     { id: "out", title: "Outside °C", h: 54 },
     { id: "el", title: "Pump kWh per hour", h: 66 },
     { id: "soc", title: "Battery kWh", h: 52 },
@@ -330,7 +359,8 @@ function renderTimeline() {
   const plan = roomPts(rows), rout = cur.length ? roomPts(cur) : null, edt = ed ? roomPts(ed) : null;
   const allR = plan.concat(rout || [], edt || [], [c.min_setpoint_c, c.max_setpoint_c]);
   const rlo = Math.floor(Math.min(...allR) - 0.3), rhi = Math.ceil(Math.max(...allR) + 0.3);
-  const RL = lanes[0];
+  const lane = (id) => lanes.find((l) => l.id === id);
+  const RL = lane("room");
   const Yr = gridY(RL, rlo, rhi, rhi - rlo > 6 ? 2 : 1, (v) => v + "°");
   const floorPath = rows.map((r, i) => (i ? "L" : "M") + x(i) + "," + Yr(floorOf(r.cls)) + "L" + x(i + 1) + "," + Yr(floorOf(r.cls))).join("");
   o.push('<path d="' + floorPath + "L" + x(n) + "," + (RL.y0 + RL.h) + "L" + x(0) + "," + (RL.y0 + RL.h) + 'Z" fill="var(--below)"/>');
@@ -349,7 +379,19 @@ function renderTimeline() {
   dls.forEach((d) => o.push('<circle cx="' + x(n) + '" cy="' + Yr(d.v) + '" r="3" fill="' + d.col + '" stroke="var(--surface)" stroke-width="2"/><text class="dl" x="' + (x(n) + 6) + '" y="' + (d.y + 4) + '">' + d.t + "</text>"));
 
   // ---- outside lane
-  const OL = lanes[1];
+  // ---- leaving-water lane: planned target (curve + offset) against the normal curve
+  const WL = lane("lwt");
+  if (WL) {
+    const lw = rows.map((r) => r.lwt), base0 = rows.map((r) => r.lwt - (r.off || 0)), lwe = ed ? ed.map((r) => r.lwt) : [];
+    const all = lw.concat(base0, lwe).filter((v) => v != null);
+    const wlo = Math.floor(Math.min(...all) - 1), whi = Math.ceil(Math.max(...all) + 1);
+    const Yw = gridY(WL, wlo, whi, Math.max(2, Math.ceil((whi - wlo) / 2)), (v) => v + "°");
+    o.push('<path d="' + path(base0, (i) => x(i + 0.5), Yw) + '" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3"/>');
+    o.push('<path d="' + path(lw, (i) => x(i + 0.5), Yw) + '" fill="none" stroke="var(--plan)" stroke-width="2"/>');
+    if (ed && lwe[0] != null) o.push('<path d="' + path(lwe, (i) => x(i + 0.5), Yw) + '" fill="none" stroke="var(--edit)" stroke-width="2"/>');
+    o.push('<text class="dl" x="' + (x(n) + 6) + '" y="' + (Yw(base0[n - 1]) + 4) + '" style="fill:var(--muted)">offset 0</text>');
+  }
+  const OL = lane("out");
   const outs = rows.map((r) => r.outdoor);
   const olo = Math.floor(Math.min(...outs) - 0.5), ohi = Math.ceil(Math.max(...outs) + 0.5);
   const Yo = gridY(OL, olo, ohi, Math.max(1, Math.ceil((ohi - olo) / 2)), (v) => v + "°");
@@ -357,7 +399,7 @@ function renderTimeline() {
   o.push('<path d="' + path(outs, (i) => x(i + 0.5), Yo) + '" fill="none" stroke="var(--ink-2)" stroke-width="2" stroke-linecap="round"/>');
 
   // ---- electricity lane: hourly bars
-  const EL = lanes[2];
+  const EL = lane("el");
   const hourly = (tr) => { const a = []; for (let i = 0; i < tr.length; i += 4) a.push(tr.slice(i, i + 4).reduce((s, r) => s + r.el_kw * 0.25, 0)); return a; };
   const hp = hourly(rows), he = ed ? hourly(ed) : null;
   const ehi = Math.max(0.5, Math.ceil(Math.max(...hp, ...(he || [0])) * 2) / 2);
@@ -372,7 +414,7 @@ function renderTimeline() {
   });
 
   // ---- battery lane
-  const BL = lanes[3];
+  const BL = lane("soc");
   const cap = S.cfg.battery.capacity_kwh;
   const Yb = gridY(BL, 0, cap, cap / 2, (v) => v);
   const socs = [p.soc0_kwh].concat(rows.map((r) => r.soc));
@@ -415,9 +457,11 @@ function renderTimeline() {
   const lg = ['<span><i class="sw" style="border-color:var(--plan)"></i>' + esc(chosenLabel()) + " plan</span>"];
   if (rout && p.chosen !== "Current routine") lg.push('<span><i class="sw dot" style="border-color:var(--muted)"></i>Your routine</span>');
   if (edt) lg.push('<span><i class="sw" style="border-color:var(--edit)"></i>Your edit</span>');
+  if (rows[0].lwt != null) lg.push('<span><i class="sw dash" style="border-color:var(--muted)"></i>Water at offset 0</span>');
   lg.push('<span><i class="sw dash" style="border-color:var(--ink-2)"></i>Setpoint</span>', '<span><i class="sw box" style="background:var(--below)"></i>Below comfort floor</span>', '<span><i class="sw box" style="background:var(--cosy)"></i>Cosy</span>', '<span><i class="sw box" style="background:var(--peak)"></i>Peak</span>');
   $("#tl-legend").innerHTML = lg.join("");
-  $("#tl-foot").innerHTML = "<b>Drag a handle</b> up or down to try a different setpoint for that block. It's simulated straight away; nothing is pushed until you choose to. Window " + fmtDate(t0) + " " + hh(t0.getHours() + t0.getMinutes() / 60) + " to " + fmtDate(tN) + " " + hh(tN.getHours()) + "; starting room " + deg(p.t_room0) + ", battery " + p.soc0_kwh + " kWh.";
+  $("#tl-foot").innerHTML = "<b>Drag a handle</b> up or down to try a different setpoint for that block. It's simulated straight away; nothing is pushed until you choose to. Window " + fmtDate(t0) + " " + hh(t0.getHours() + t0.getMinutes() / 60) + " to " + fmtDate(tN) + " " + hh(tN.getHours()) + "; starting room " + deg(p.t_room0) + ", battery " + p.soc0_kwh + " kWh" +
+    (p.battery && p.battery.max_discharge_kw != null ? ", battery output capped at " + p.battery.max_discharge_kw + " kW" + (p.battery.discharge_limit_source ? " (read from " + esc(p.battery.discharge_limit_source) + ")" : "") : "") + ".";
 
   // hover readout
   const svg = box.querySelector("svg"), hit = $("#tl-hit"), cross = $("#tl-cross"), tip = $("#tip");
@@ -433,6 +477,7 @@ function renderTimeline() {
     h += row("var(--plan)", "Room (plan)", deg(r.room, 2));
     if (cur[i] && p.chosen !== "Current routine") h += row("var(--muted)", "Room (routine)", deg(cur[i].room, 2));
     if (ed) h += row("var(--edit)", "Room (edit)", deg(ed[i].room, 2) + (ed[i].target !== r.target ? " @" + ed[i].target + "°" : ""));
+    if (r.lwt != null) h += row("", "Water target", deg(r.lwt) + " (" + sgn(r.off) + ")" + (ed && ed[i].off !== r.off ? " · edit " + sgn(ed[i].off) : ""));
     h += row("", "Outside", deg(r.outdoor)) + row("", "Pump", r.el_kw.toFixed(2) + " kW") + row("", "Battery", r.soc.toFixed(1) + " kWh");
     tip.innerHTML = h; tip.hidden = false;
     const tw = tip.offsetWidth, th = tip.offsetHeight;
@@ -452,7 +497,7 @@ function renderTimeline() {
     const bi = +g.dataset.i, sp = blockSpan[bi], cx = (sp[0] + sp[1]) / 2, lab = g.querySelector(".hdl-lab");
     let v = vals[bi], dragging = false;
     const place = (nv) => { v = nv; g.setAttribute("transform", "translate(" + cx + "," + Yr(v) + ")"); lab.textContent = v.toFixed(1) + "°"; g.setAttribute("aria-valuenow", v); };
-    const commit = () => { if (Math.abs(v - vals[bi]) > 1e-9) { const nv = (S.edit || planValues()).slice(); nv[bi] = v; setEdit(nv); } else lab.textContent = ""; };
+    const commit = () => { if (Math.abs(v - vals[bi]) > 1e-9) { const nv = (S.edit || planValues()).slice(); nv[bi] = v; setEdit(nv, S.editOff); } else lab.textContent = ""; };
     g.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); dragging = true; g.setPointerCapture(e.pointerId); g.classList.add("dragging"); hide(); place(toVal(e.clientY)); });
     g.addEventListener("pointermove", (e) => { if (dragging) place(toVal(e.clientY)); });
     const end = () => { if (!dragging) return; dragging = false; g.classList.remove("dragging"); commit(); };
@@ -460,7 +505,7 @@ function renderTimeline() {
     g.addEventListener("keydown", (e) => {
       const d = e.key === "ArrowUp" || e.key === "ArrowRight" ? 0.5 : e.key === "ArrowDown" || e.key === "ArrowLeft" ? -0.5 : 0;
       if (!d) return; e.preventDefault();
-      const nv = (S.edit || planValues()).slice(); nv[bi] = Math.max(c.min_setpoint_c, Math.min(c.max_setpoint_c, nv[bi] + d)); setEdit(nv);
+      const nv = (S.edit || planValues()).slice(); nv[bi] = Math.max(c.min_setpoint_c, Math.min(c.max_setpoint_c, nv[bi] + d)); setEdit(nv, S.editOff);
       setTimeout(() => box.querySelector('.hdl[data-i="' + bi + '"]')?.focus(), 400);
     });
   });
@@ -470,8 +515,10 @@ function renderTimeline() {
 let simTimer = null, simSeq = 0;
 function renderEditor() {
   const p = S.plan, base = planValues(), vals = S.edit || base, c = S.cfg.comfort;
+  const oOn = offOn(), baseO = planOffsets(), offs = S.editOff || baseO, oc = p.lwt_offset || {};
   const d = dateOf(p.for_date);
-  $("#edit-sub").innerHTML = "Changes are simulated against tonight's forecast. Nothing goes to Home Assistant until you press Push. Editing <b>" + fmtDate(d) + "</b>.";
+  $("#edit-sub").innerHTML = "Changes are simulated against tonight's forecast. Nothing goes to Home Assistant until you press Push. Editing <b>" + fmtDate(d) + "</b>." +
+    (oOn ? " <b>Water</b> is the leaving-water offset: lower means cooler radiators and a better COP, but slower heating." : "");
   const un = $("#undo");
   const prev = p.manual && p.manual.previous;
   un.hidden = !(p.chosen === "Your edit" && prev);
@@ -483,30 +530,37 @@ function renderEditor() {
   ed.style.gridTemplateColumns = S.cfg.blocks.map(([a, b]) => Math.max(2.2, b - a) + "fr").join(" ");
   const lo = c.min_setpoint_c, hi = c.max_setpoint_c;
   ed.innerHTML = S.cfg.blocks.map(([a, b], i) => {
-    const v = vals[i], t = tariff(a), ch = Math.abs(v - base[i]) > 1e-9;
+    const v = vals[i], t = tariff(a), ch = Math.abs(v - base[i]) > 1e-9 || (oOn && offs[i] !== baseO[i]);
+    const orow = oOn ? '<div class="orow"><span class="olab">Water</span><button type="button" class="step sm" data-o="' + i + '" data-d="-1" aria-label="Cooler water ' + rng(a, b) + '"' + (offs[i] <= oc.min ? " disabled" : "") + '>−</button><b class="oval">' + sgn(offs[i]) + '</b><button type="button" class="step sm" data-o="' + i + '" data-d="1" aria-label="Hotter water ' + rng(a, b) + '"' + (offs[i] >= oc.max ? " disabled" : "") + ">+</button></div>" : "";
     return '<div class="blk' + (ch ? " changed" : "") + '"><div class="time">' + rng(a, b) + '</div><span class="tag ' + t.slot + '">' + t.label + "</span>" +
       '<div class="bar-wrap" aria-hidden="true"><div class="bar" style="height:' + (8 + ((v - lo) / (hi - lo)) * 92) + '%"></div></div>' +
       '<div class="val">' + v.toFixed(1) + "<small>°C</small></div>" +
       '<div class="steps"><button type="button" class="step" data-i="' + i + '" data-d="-0.5" aria-label="Lower ' + rng(a, b) + '"' + (v <= lo ? " disabled" : "") + '>−</button><button type="button" class="step" data-i="' + i + '" data-d="0.5" aria-label="Raise ' + rng(a, b) + '"' + (v >= hi ? " disabled" : "") + ">+</button></div>" +
-      '<div class="was">' + (ch ? "plan " + base[i].toFixed(1) + "°" : "") + "</div></div>";
+      orow + '<div class="was">' + (ch ? "plan " + base[i].toFixed(1) + "°" + (oOn ? " " + sgn(baseO[i]) : "") : "") + "</div></div>";
   }).join("");
-  ed.querySelectorAll(".step").forEach((btn) => btn.addEventListener("click", () => {
+  ed.querySelectorAll(".step[data-i]").forEach((btn) => btn.addEventListener("click", () => {
     const i = +btn.dataset.i, nv = (S.edit || planValues()).slice();
     nv[i] = Math.round((nv[i] + +btn.dataset.d) * 2) / 2;
-    setEdit(nv);
+    setEdit(nv, S.editOff);
+  }));
+  ed.querySelectorAll(".step[data-o]").forEach((btn) => btn.addEventListener("click", () => {
+    const i = +btn.dataset.o, no = (S.editOff || planOffsets()).slice();
+    no[i] = Math.max(oc.min, Math.min(oc.max, no[i] + +btn.dataset.d));
+    setEdit(S.edit || planValues().slice(), no);
   }));
   renderEdSummary();
 }
-function setEdit(values) {
+function setEdit(values, offsets) {
   S.edit = values;
+  if (offsets !== undefined) S.editOff = offOn() ? offsets : null;
   renderEditor();
   clearTimeout(simTimer);
-  if (sameVals(values, planValues())) { S.editRes = null; renderTimeline(); renderEdSummary(); return; }
+  if (sameVals(values, planValues()) && (!offOn() || !S.editOff || sameVals(S.editOff, planOffsets()))) { S.editRes = null; renderTimeline(); renderEdSummary(); return; }
   $("#ed-msg").className = "msg"; $("#ed-msg").textContent = "Simulating…";
   simTimer = setTimeout(async () => {
     const seq = ++simSeq;
     try {
-      const r = await api("/api/simulate", { values });
+      const r = await api("/api/simulate", offOn() ? { values, offsets: S.editOff || planOffsets() } : { values });
       if (seq !== simSeq) return;
       S.editRes = r; $("#ed-msg").textContent = r.exact ? "" : "Approximate: this plan was made before what-if support, so solar gain is left out.";
     } catch (e) { $("#ed-msg").className = "msg err"; $("#ed-msg").textContent = e.message; }
@@ -532,26 +586,26 @@ function renderEdSummary() {
   $("#ed-push").title = past ? "This plan's day has passed. Re-run the optimiser first." : e ? "" : "Change a setpoint first";
 }
 async function undoEdit() {
-  const p = S.plan, prev = p.manual.previous, vals = p.strategies[prev].values;
-  const body = "<p>This puts the planner's <b>" + esc(NAMES[prev] || prev) + "</b> plan back into <code>" + esc(S.cfg.schedule_entity) + "</code> for " + WDL[wdIdx(dateOf(p.for_date))] + ".</p>" + strip(tidy(vals));
+  const p = S.plan, prev = p.manual.previous, vals = p.strategies[prev].values, offs = p.strategies[prev].offsets || null;
+  const body = "<p>This puts the planner's <b>" + esc(NAMES[prev] || prev) + "</b> plan back into <code>" + esc(S.cfg.schedule_entity) + "</code> for " + WDL[wdIdx(dateOf(p.for_date))] + ".</p>" + strip(tidy(vals, offs));
   if (!(await confirmDlg("Undo your edit?", body, "Undo"))) return;
   const m = $("#ed-msg"); m.className = "msg"; m.textContent = "Restoring…";
   try { const r = await api("/api/restore", {}); await loadAll(); $("#ed-msg").className = "msg " + (r.pushed.verified ? "ok" : "err"); $("#ed-msg").textContent = r.pushed.verified ? "Restored and verified." : "Restored, but the read-back did not match."; }
   catch (e) { m.className = "msg err"; m.textContent = e.message; }
 }
 function wireEditor() {
-  $("#ed-reset").onclick = () => setEdit(planValues());
-  $("#ed-routine").onclick = () => setEdit(routineValues().slice());
+  $("#ed-reset").onclick = () => setEdit(planValues(), planOffsets());
+  $("#ed-routine").onclick = () => { const r = S.plan.strategies["Current routine"]; setEdit(r.values.slice(), r.offsets ? r.offsets.slice() : null); };
   $("#ed-rerun").onclick = () => rerun("/api/rerun", {}, $("#ed-msg"));
   $("#ed-push").onclick = async () => {
-    const vals = S.edit, p = S.plan;
-    const blocks = tidy(vals);
+    const vals = S.edit || planValues(), offs = offOn() ? S.editOff || planOffsets() : null, p = S.plan;
+    const blocks = tidy(vals, offs);
     const body = "<p>This writes <b>" + WDL[wdIdx(dateOf(p.for_date))] + "</b> in <code>" + esc(S.cfg.schedule_entity) + "</code>. Your live schedule is not touched, and you can undo it afterwards.</p>" +
-      strip(blocks) + '<p style="font-variant-numeric:tabular-nums">' + blocks.map((b) => rng(b.from, b.to) + " " + b.temperature.toFixed(1) + "°").join(" · ") + "</p>";
+      strip(blocks) + '<p style="font-variant-numeric:tabular-nums">' + blocks.map((b) => rng(b.from, b.to) + " " + b.temperature.toFixed(1) + "°" + (b.lwt_offset !== undefined ? " (water " + sgn(b.lwt_offset) + ")" : "")).join(" · ") + "</p>";
     if (!(await confirmDlg("Push your edited plan?", body, "Push"))) return;
     const m = $("#ed-msg"); m.className = "msg"; m.textContent = "Pushing…";
     try {
-      const r = await api("/api/push", { values: vals });
+      const r = await api("/api/push", offs ? { values: vals, offsets: offs } : { values: vals });
       await loadAll();
       $("#ed-msg").className = "msg " + (r.pushed.verified ? "ok" : "err");
       $("#ed-msg").textContent = r.pushed.verified ? "Pushed and verified." : "Pushed, but the read-back did not match.";
@@ -573,19 +627,20 @@ function renderStrategies() {
   const lo = Math.min(...all, S.cfg.comfort.soft_floor_c) - 0.2, hi = Math.max(...all) + 0.2;
   $("#st-cards").innerHTML = names.map((n) => {
     const r = p.strategies[n], chosen = n === p.chosen, base = n === "Current routine";
-    const ex = base ? ["the setpoints from your live schedule"] : explain(r.values, cur.values);
+    const ex = base ? ["the setpoints from your live schedule"] : explain(r.values, cur.values, r.offsets, cur.offsets);
     const ok = r.hours_below == null ? r.penalty < 0.05 : r.hours_below < 0.25;
     return '<article class="scard' + (chosen ? " is-chosen" : "") + '"><div class="nm"><i class="sw' + (base ? " dot" : "") + '" style="border-color:' + COLOR[n] + '"></i>' + esc(NAMES[n] || n) + (chosen ? ' <span class="tag chosen">Chosen</span>' : "") + "</div>" +
       '<div><div class="k-small">Electricity</div><div class="big">' + gbp(r.grid_cost) + "</div>" + (base ? '<span class="d" style="color:var(--muted)">Baseline</span>' : moneyDelta(r.grid_cost, cur.grid_cost)) + "</div>" +
       '<div class="comfort ' + (ok ? "ok" : "low") + '"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' + (ok ? '<path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>' : '<path d="M8 3v6M8 12v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>') + "</svg>" + comfortText(r) + "</div>" +
       (cmp[n] ? sparkline(cmp[n].room, COLOR[n], lo, hi) : "") +
       strip(tidy(r.values), false) +
-      '<div class="kv"><span>Pump</span><b>' + r.kwh_hp.toFixed(1) + " kWh</b><span>Coldest awake</span><b>" + deg(r.t_min_awake) + "</b><span>Model score</span><b>" + gbp(r.total) + "</b></div>" +
-      '<p class="why">' + (ex.length ? esc(ex.slice(0, 3).join("; ")) : "Same setpoints as your routine.") + "</p>" +
+      '<div class="kv"><span>Pump</span><b>' + r.kwh_hp.toFixed(1) + " kWh</b>" + (offOn() && r.offsets ? "<span>Water offset</span><b>" + offSummary(r.offsets) + "</b>" : "") + "<span>Coldest awake</span><b>" + deg(r.t_min_awake) + "</b><span>Model score</span><b>" + gbp(r.total) + "</b></div>" +
+      '<p class="why">' + (ex.length ? esc(ex.slice(0, 4).join("; ")) : "Same setpoints as your routine.") + "</p>" +
       '<button type="button" class="btn ghost" data-try="' + esc(n) + '">Open in editor</button></article>';
   }).join("");
   document.querySelectorAll("[data-try]").forEach((b) => b.addEventListener("click", () => {
-    setEdit(p.strategies[b.dataset.try].values.slice());
+    const st = p.strategies[b.dataset.try];
+    setEdit(st.values.slice(), st.offsets ? st.offsets.slice() : null);
     if (MOBILE()) setTab("plan"); else $("#edit").scrollIntoView();
   }));
 }

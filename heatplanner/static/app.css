@@ -154,6 +154,12 @@ svg text { font-family: inherit; }
 .step { width: 38px; height: 34px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--ink); font-size: 18px; line-height: 1; cursor: pointer; }
 .step:hover { border-color: var(--axis); }
 .step:disabled { opacity: .35; cursor: default; }
+.orow { display: flex; align-items: center; gap: 2px; font-size: 12px; color: var(--ink-2); flex-wrap: wrap; justify-content: center; }
+.orow .olab { margin-right: 2px; }
+.orow .oval { min-width: 26px; text-align: center; color: var(--ink); font-variant-numeric: tabular-nums; }
+.step.sm { width: 26px; height: 28px; font-size: 15px; }
+.orow .olab { flex-basis: 100%; text-align: center; font-size: 11px; }
+@media (max-width: 680px) { .orow .olab { flex-basis: auto; } }
 .blk .was { font-size: 11px; color: var(--muted); min-height: 15px; }
 @media (max-width: 680px) {
   .editor { grid-template-columns: 1fr !important; }
@@ -165,6 +171,7 @@ svg text { font-family: inherit; }
   .blk .step { width: 34px; }
   .blk .time { font-size: 12px !important; }
   .blk .was { grid-column: 1 / -1; min-height: 0; }
+  .blk .orow { grid-column: 1 / -1; justify-self: end; }
   .blk .was:empty { display: none; }
 }
 .ed-summary { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 14px; }
@@ -285,7 +292,7 @@ dialog p { color: var(--ink-2); font-size: 14px; }
 .today-strip .strip { height: 28px; border-radius: 8px; }
 .now-mark { position: absolute; top: -5px; bottom: -5px; width: 3px; margin-left: -1.5px; background: var(--ink); border-radius: 2px; box-shadow: 0 0 0 2px var(--surface); }
 .today-ax { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
-.facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 16px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 16px; }
 .fact { background: var(--surface-2); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .fact span { color: var(--ink-2); font-size: 12px; }
 .fact b { font-size: 17px; font-weight: 650; }

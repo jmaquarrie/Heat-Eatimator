@@ -180,6 +180,11 @@ def collect(ha, cfg, days=14):
     raw, rawstate = {}, {}
     for k in ("outdoor", "room", "heat_kwh", "water_kwh", "cop", "lwt", "rate", "target"):
         raw[k] = _series(ha.history(e[k], start.isoformat(), end.isoformat()))
+    for k in ("battery_soc", "battery_charge_w", "battery_discharge_w"):   # optional: real battery behaviour
+        try:
+            raw[k] = _series(ha.history(e[k], start.isoformat(), end.isoformat())) if e.get(k) else []
+        except Exception:
+            raw[k] = []
     for k in ("heating", "person"):
         try:
             rawstate[k] = _raw(ha.history(e[k], start.isoformat(), end.isoformat()))
@@ -194,6 +199,12 @@ def collect(ha, cfg, days=14):
     onfrac = {g: _fraction(rawstate["heating"], g, g + half, ("on",)) for g in grid} if rawstate["heating"] else None
     heat = _counter_increments(raw["heat_kwh"], grid, onfrac)
     water = _counter_increments(raw["water_kwh"], grid)
+    offs = []
+    if e.get("lwt_offset"):
+        try:   # leaving-water offset history, so the weather-curve fit can remove it
+            offs = _series(ha.history_attr(e["lwt_offset"], start.isoformat(), end.isoformat(), "temperature"))
+        except Exception:
+            offs = []
     gridkwh = None
     if e.get("grid_import_kwh"):
         try:
@@ -217,6 +228,9 @@ def collect(ha, cfg, days=14):
         row["heat_kwh"] = heat[g]
         row["water_kwh"] = water[g]
         row["grid_kwh"] = None if gridkwh is None else round(gridkwh[g], 4)
+        row["lwt_offset"] = _mean_over(offs, g, g2) if offs else None
+        for k in ("battery_soc", "battery_charge_w", "battery_discharge_w"):
+            row[k] = _mean_over(raw[k], g, g2) if raw[k] else None
         row["heating"] = None if onfrac is None else onfrac[g]
         row["home"] = _fraction(rawstate["person"], g, g2, ("home",)) if rawstate["person"] else None
         w = wx.get(g.replace(minute=0))

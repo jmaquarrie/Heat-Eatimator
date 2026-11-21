@@ -368,19 +368,29 @@ def live_status():
     room, outdoor, soc, rate = (get(e[k]) for k in ("room", "outdoor", "battery_soc", "rate"))
     heating, climate, helper, budget = get(e["heating"]), get(e.get("climate", "")), get(cfg["schedule_entity"]), get(e.get("api_budget", ""))
     gridp = get(e["grid_power"]) if e.get("grid_power") else None
+    offent = get(e["lwt_offset"]) if e.get("lwt_offset") else None
+    rooms = {name: num(get(eid)) for name, eid in (cfg.get("other_rooms") or {}).items()}
     if room is None and outdoor is None:
         out["error"] = "Home Assistant did not answer"
         return out
     out.update({"available": True, "room": num(room), "outdoor": num(outdoor), "battery_pct": num(soc), "rate": num(rate),
-                "heating": (heating or {}).get("state"), "api_budget": num(budget), "grid_w": num(gridp) if gridp else None})
+                "heating": (heating or {}).get("state"), "api_budget": num(budget), "grid_w": num(gridp) if gridp else None,
+                "other_rooms": {k: v for k, v in rooms.items() if v is not None}})
     if climate:
         a = climate.get("attributes", {})
         out["climate"] = {"state": climate.get("state"), "setpoint": a.get("temperature"), "current": a.get("current_temperature")}
     if helper:
         a = helper.get("attributes", {})
-        out["helper"] = {"state": helper.get("state"), "temperature": a.get("temperature"), "next_event": a.get("next_event")}
+        out["helper"] = {"state": helper.get("state"), "temperature": a.get("temperature"), "next_event": a.get("next_event"),
+                         "lwt_offset": a.get("lwt_offset")}
+    if offent:
+        a = offent.get("attributes", {})
+        out["offset"] = {"value": a.get("temperature"), "min": a.get("min_temp"), "max": a.get("max_temp"),
+                         "lwt": a.get("current_temperature")}
     sp, ht = (out.get("climate") or {}).get("setpoint"), (out.get("helper") or {}).get("temperature")
     out["following"] = None if sp is None or ht is None else abs(float(sp) - float(ht)) < 0.26
+    ho, ov = (out.get("helper") or {}).get("lwt_offset"), (out.get("offset") or {}).get("value")
+    out["offset_following"] = None if ho is None or ov is None else abs(float(ho) - float(ov)) < 0.5
     STATUS_CACHE.update({"at": time.time(), "body": out})
     return out
 
@@ -457,7 +467,7 @@ def do_simulate(body):
     if not plan:
         return 404, json.dumps({"error": "no plan yet"}), "application/json"
     try:
-        return 200, json.dumps(planner.simulate_values(data.load_config(), plan, body.get("values"))), "application/json"
+        return 200, json.dumps(planner.simulate_values(data.load_config(), plan, body.get("values"), body.get("offsets"))), "application/json"
     except ValueError as e:
         return 400, json.dumps({"error": str(e)}), "application/json"
 
@@ -489,7 +499,7 @@ def do_push(body):
         if RUN["state"] == "running":
             return 409, json.dumps({"error": "the model is re-running; try again in a minute"}), "application/json"
     try:
-        new = planner.push_values(_ha(), data.load_config(), plan, body.get("values"))
+        new = planner.push_values(_ha(), data.load_config(), plan, body.get("values"), body.get("offsets"))
     except ValueError as e:
         return 400, json.dumps({"error": str(e)}), "application/json"
     STATUS_CACHE["at"] = 0

@@ -52,6 +52,42 @@ value. A plan can therefore "win" while costing more in electricity, because it 
 dropping below the comfort floor. The dashboard shows both: the headline names real pounds, and
 the cards show electricity against routine separately.
 
+## Leaving water offset
+
+With weather-dependent control the Daikin holds the water at `curve(outside) + offset`. The planner
+now picks an offset per block as well as a setpoint:
+
+* **Lower offset:** cooler radiators, better COP, but less heat output, so the room warms more slowly.
+* **Higher offset:** faster heating, worse COP.
+* The optimiser tunes setpoints first, then setpoints and offsets together. Each offset change is
+  priced (`write_cost_gbp`, default 1p) so it doesn't flip for nothing.
+* The range is `lwt_offset.min/max` in config (default −5 to +5), clipped to the entity's own limits.
+* Offsets are written into the helper as block data (`{temperature, lwt_offset}`).
+  `deploy/ha/planner_offset_to_daikin.yaml` applies them to `climate.altherma_leaving_water_offset`,
+  with the same Daikin-budget guards as the setpoint automation.
+* Set `"lwt_offset": {"enabled": false}` in `config.json` to plan setpoints only.
+
+Model terms, all refitted daily from your LWT history once there's enough of it:
+`lwc_a`/`lwc_b` (the weather curve, starting at LWT 36.4 − 0.55 × outside) and `k_emit_kw_per_k`
+(radiator output per K of mean water over room). The default of 1.0 reproduces your observed
+04:00–15:00 warm-up; 0.4 could not. HA-measured COP is scaled by Daikin's published LWT
+sensitivity, so offsets move both halves of the COP blend.
+
+Also changed: the end-of-window "heat left in the house" term now only charges for ending colder
+than 19.5 °C. It gives no credit for ending warmer, which had made overheating at 22:00–24:00 look
+profitable.
+
+## Battery and other entities
+
+* The battery discharge limit is read at plan time from `battery.discharge_limit_entity`
+  (`number.marstek_m1_max_discharge_power`, currently 900 W), so the model no longer assumes
+  2.5 kW of cover. Charge and discharge limits are separate (`max_charge_kw`, `max_discharge_kw`).
+* Stored every data run for later learning: battery state of charge, charging and discharging power
+  (`sensor.anker_solix_battery_charging_power` / `_discharging_power`).
+* Grid meter defaults: `sensor.octopus_energy_electricity_…_current_total_consumption` (Home Mini,
+  lifetime kWh) and `sensor.anker_solix_grid_import_power`.
+* `other_rooms` (hallway and landing motion-sensor temperatures) show on the Now screen.
+
 ## API
 
 | Method | Path | Notes |
@@ -59,8 +95,8 @@ the cards show electricity against routine separately.
 | GET | `/api/plan`, `/api/params`, `/api/plans`, `/api/config`, `/api/log` | stored JSON |
 | GET | `/api/status` | live HA readings (REST reads only; no Daikin cloud calls) |
 | GET | `/api/actuals?date=YYYY-MM-DD` | measured hourly room / kWh beside that day's prediction (default yesterday) |
-| POST | `/api/simulate` `{"values":[7 setpoints]}` | what-if, read-only |
-| POST | `/api/push` `{"values":[...]}` | writes the plan's weekday in `schedule.heat_pump_planner` only |
+| POST | `/api/simulate` `{"values":[7 setpoints], "offsets":[7]}` | what-if, read-only; offsets optional |
+| POST | `/api/push` `{"values":[...], "offsets":[...]}` | writes the plan's weekday in `schedule.heat_pump_planner` only |
 | POST | `/api/restore` | undo a hand edit: re-push the strategy the planner had chosen |
 | POST | `/api/occupancy`, `/api/rerun` | as before |
 

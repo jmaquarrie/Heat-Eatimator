@@ -527,7 +527,7 @@ function renderEditor() {
     $("#undo-btn").onclick = undoEdit;
   }
   const ed = $("#editor");
-  ed.style.gridTemplateColumns = S.cfg.blocks.map(([a, b]) => Math.max(2.2, b - a) + "fr").join(" ");
+  ed.style.gridTemplateColumns = "repeat(" + S.cfg.blocks.length + ", minmax(0, 1fr))";
   const lo = c.min_setpoint_c, hi = c.max_setpoint_c;
   ed.innerHTML = S.cfg.blocks.map(([a, b], i) => {
     const v = vals[i], t = tariff(a), ch = Math.abs(v - base[i]) > 1e-9 || (oOn && offs[i] !== baseO[i]);

@@ -125,7 +125,7 @@ function render() {
 }
 
 /* ---------------------------------------------------------------- chips */
-function chip(cls, html, title) { return '<span class="chip ' + cls + '"' + (title ? ' title="' + esc(title) + '"' : "") + '><span class="dot" aria-hidden="true"></span>' + html + "</span>"; }
+function chip(cls, html, title) { return '<span class="chip ' + cls + '"' + (title ? ' title="' + esc(title) + '"' : "") + '><span class="dot" aria-hidden="true"></span><span>' + html + "</span></span>"; }
 function renderChips() {
   if (!S.plan || !S.cfg) return;
   const out = [];

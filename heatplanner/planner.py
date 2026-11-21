@@ -333,14 +333,44 @@ def plan_offsets(plan):
     return None
 
 
-def simulate_values(cfg, plan, values, offsets=None):
-    """What-if: simulate the planned day with the given block setpoints (and offsets). No HA access needed."""
+def ended_blocks(cfg, date, now=None):
+    """Indices of cfg blocks that have already finished on `date` (all of them for a past date)."""
+    now = now or dt.datetime.now(LOCAL).replace(tzinfo=None)
+    if date > now.date():
+        return set()
+    if date < now.date():
+        return set(range(len(cfg["blocks"])))
+    h = now.hour + now.minute / 60
+    return {i for i, (a, b) in enumerate(cfg["blocks"]) if b <= h}
+
+
+def check_unchanged(cfg, ended, old_vals, new_vals, old_offs=None, new_offs=None):
+    for i in sorted(ended):
+        a, b = cfg["blocks"][i]
+        if abs(old_vals[i] - new_vals[i]) > 1e-9 or (old_offs is not None and new_offs is not None and old_offs[i] != new_offs[i]):
+            raise ValueError("%02d:00-%02d:00 has already ended and can't be changed" % (a, b))
+
+
+def today_tail_available(plan):
+    """True when the plan is for tomorrow and was made today, so the rest of today is held in sim.fixed."""
+    s = plan.get("sim") or {}
+    today = dt.datetime.now(LOCAL).date().isoformat()
+    return bool(s.get("fixed")) and s.get("start", "")[:10] == today and plan["for_date"] != today
+
+
+def simulate_values(cfg, plan, values, offsets=None, today_values=None, today_offsets=None):
+    """What-if: simulate the planned day with the given block setpoints (and offsets). No HA access needed.
+    today_values / today_offsets replace the rest of today (the start-day blocks) instead."""
     values = check_values(cfg, values)
     ctx, fixed, params, _, fixed_off = sim_context(cfg, plan)
     if fixed_off is not None:
         offsets = check_offsets(cfg, plan, offsets) if offsets is not None else (plan_offsets(plan) or [0] * len(values))
     else:
         offsets = None
+    if today_values is not None:
+        fixed = model.blocks_from_values(cfg, check_values(cfg, today_values))
+        if fixed_off is not None and today_offsets is not None:
+            fixed_off = model.blocks_from_values(cfg, check_offsets(cfg, plan, today_offsets))
     r = model.evaluate(cfg, params, ctx, fixed, values, trace=True, offsets=offsets, fixed_off=fixed_off)
     out = {k: r[k] for k in SUMMARY_KEYS}
     out.update({"values": values, "offsets": offsets,
@@ -354,6 +384,9 @@ def push_values(ha, cfg, plan, values, offsets=None):
     if dt.date.fromisoformat(plan["for_date"]) < dt.datetime.now(LOCAL).date():
         raise ValueError("the latest plan is for %s, which has passed; re-run the model first" % plan["for_date"])
     res = simulate_values(cfg, plan, values, offsets)
+    # blocks of the plan's day that have already ended (when the plan is for today) can't change
+    check_unchanged(cfg, ended_blocks(cfg, dt.date.fromisoformat(plan["for_date"])), [b["temperature"] for b in plan["blocks_raw"]],
+                    res["values"], plan_offsets(plan), res["offsets"])
     previous = (plan.get("manual") or {}).get("previous") if plan["chosen"] == "Your edit" else plan["chosen"]
     plan = dict(plan)
     plan["blocks"] = res["blocks"]
@@ -463,12 +496,43 @@ def validate(cfg, blocks):
             raise ValueError("gap/overlap in blocks")
 
 
+def push_today(ha, cfg, plan, values, offsets=None):
+    """After 22:00 the plan is for tomorrow; this changes the rest of TODAY in the helper (blocks not yet
+    ended), leaving tomorrow's plan as it is. Records the change in the plan's sim block."""
+    if not today_tail_available(plan):
+        raise ValueError("today is the plan's own day: edit it in the normal editor")
+    s = plan["sim"]
+    old_vals = [b[2] for b in s["fixed"]]
+    old_offs = [b[2] for b in s["fixed_off"]] if s.get("fixed_off") else None
+    res = simulate_values(cfg, plan, [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan),
+                          today_values=values, today_offsets=offsets if old_offs is not None else None)
+    new_vals = check_values(cfg, values)
+    new_offs = check_offsets(cfg, plan, offsets) if (old_offs is not None and offsets is not None) else old_offs
+    today = dt.datetime.now(LOCAL).date()
+    check_unchanged(cfg, ended_blocks(cfg, today), old_vals, new_vals, old_offs, new_offs)
+    blocks = plan_blocks(cfg, new_vals, new_offs)
+    validate(cfg, blocks)
+    pushed = push_day(ha, cfg, DAYS[today.weekday()], blocks)
+    plan = dict(plan)
+    plan["sim"] = dict(s, fixed=[[a, b, v] for (a, b), v in zip(cfg["blocks"], new_vals)],
+                       fixed_off=[[a, b, o] for (a, b), o in zip(cfg["blocks"], new_offs)] if new_offs is not None else s.get("fixed_off"))
+    plan["fixed_today_tail"] = [{"from": a, "to": b, "temperature": v} for (a, b), v in zip(cfg["blocks"], new_vals) if b > 20]
+    plan["today_edit"] = {"at": pushed["at"], "date": today.isoformat(), "blocks": blocks, "verified": pushed["verified"],
+                          "total": res["total"], "grid_cost": res["grid_cost"]}
+    save_plan(plan)
+    return plan, pushed
+
+
 def push(ha, cfg, plan):
     validate(cfg, plan["blocks"])
+    return push_day(ha, cfg, plan["weekday"], plan["blocks"])
+
+
+def push_day(ha, cfg, day, blocks):
+    """Write one weekday of the planner helper (all seven days are sent, as the websocket API needs) and verify."""
     helper, created = ensure_helper(ha, cfg)
-    day = plan["weekday"]
     new = {k: v for k, v in helper.items() if k in DAYS}
-    new[day] = blocks_to_helper([(b["from"], b["to"], b["temperature"], b.get("lwt_offset")) for b in plan["blocks"]])
+    new[day] = blocks_to_helper([(b["from"], b["to"], b["temperature"], b.get("lwt_offset")) for b in blocks])
     ha.schedule_update(helper["id"], {"name": helper.get("name", cfg["schedule_name"]), "icon": helper.get("icon", "mdi:heat-pump"), **{d: new.get(d, []) for d in DAYS}})
     back = get_helper(ha, cfg)
     ok = back and back.get(day) == new[day]

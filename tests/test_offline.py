@@ -25,6 +25,12 @@ class Offline(unittest.TestCase):
         self.cfg = data.load_config()
         self.plan = data.load_json("plan_latest.json", None)
 
+    def keep_ended(self, vals, base):
+        """Edits may only touch blocks that haven't ended yet (the demo plan is for today)."""
+        import datetime as dt
+        ended = planner.ended_blocks(self.cfg, dt.date.fromisoformat(self.plan["for_date"]))
+        return [base[i] if i in ended else v for i, v in enumerate(vals)]
+
     def fake(self):
         ha = demo.FakeHA()
         planner.ensure_helper(ha, self.cfg)
@@ -55,12 +61,12 @@ class Offline(unittest.TestCase):
     def test_push_edit_writes_only_planner_helper(self):
         ha = self.fake()
         live_before = [dict(b) for b in ha.live["saturday"]]
-        vals = [18, 20, 19, 21, 19, 20, 16]
+        vals = self.keep_ended([18, 20, 19, 21, 19, 20, 16], [b["temperature"] for b in self.plan["blocks_raw"]])
         new = planner.push_values(ha, self.cfg, self.plan, vals)
         self.assertEqual(new["chosen"], "Your edit")
         self.assertTrue(new["pushed"]["verified"])
         day = ha.helper[new["weekday"]]
-        self.assertEqual([b["data"]["temperature"] for b in day], [18, 20, 19, 21, 19, 20, 16])
+        self.assertEqual([b["data"]["temperature"] for b in day], vals)
         self.assertEqual(ha.live["saturday"], live_before)
         self.assertEqual(data.load_json("plan_latest.json", None)["chosen"], "Your edit")
         planner.publish_sensors(ha, self.cfg, new)
@@ -83,9 +89,10 @@ class Offline(unittest.TestCase):
         with self.assertRaises(ValueError):
             planner.simulate_values(self.cfg, self.plan, opt["values"], [0, 0, -8, 0, 0, 0, 0])
         ha = self.fake()
-        new = planner.push_values(ha, self.cfg, self.plan, opt["values"], [-3, -3, -3, 0, 0, 0, 0])
+        offs = self.keep_ended([-3, -3, -3, 0, 0, 0, 3], opt["offsets"])
+        new = planner.push_values(ha, self.cfg, self.plan, opt["values"], offs)
         day = ha.helper[new["weekday"]]
-        self.assertEqual(day[0]["data"].get("lwt_offset"), -3)
+        self.assertEqual(day[-1]["data"].get("lwt_offset"), 3)
         self.assertTrue(all("lwt_offset" in b["data"] for b in day))
         data.save_json("plan_latest.json", self.plan)
 
@@ -110,6 +117,45 @@ class Offline(unittest.TestCase):
         self.assertLess(abs(new["lwc_b"] - (0.5 * -0.55 + 0.5 * -0.6)), 0.05)   # blended with prior at weight 50%
         self.assertGreater(new["k_emit_kw_per_k"], 0.9)                           # pulled from prior 1.0 toward 0.9..
         self.assertLess(new["k_emit_kw_per_k"], 1.0)
+
+    def test_ended_blocks_rule(self):
+        import datetime as dt
+        d = dt.date(2026, 11, 21)
+        at = lambda h, m=0: dt.datetime(2026, 11, 21, h, m)
+        self.assertEqual(planner.ended_blocks(self.cfg, d, at(15, 30)), {0, 1, 2})     # 00-04, 04-07, 07-13 done
+        self.assertEqual(planner.ended_blocks(self.cfg, d, at(13, 0)), {0, 1, 2})      # 13:00 exactly: 07-13 has ended
+        self.assertEqual(planner.ended_blocks(self.cfg, d + dt.timedelta(days=1), at(23)), set())
+        self.assertEqual(len(planner.ended_blocks(self.cfg, d - dt.timedelta(days=1), at(1))), 7)
+        with self.assertRaises(ValueError):
+            planner.check_unchanged(self.cfg, {0}, [18] * 7, [19] + [18] * 6)
+        planner.check_unchanged(self.cfg, {0}, [18] * 7, [18] * 6 + [20])            # future change is fine
+
+    def test_push_today_after_2200_leaves_tomorrow_alone(self):
+        import copy, datetime as dt
+        now = dt.datetime.now(planner.LOCAL).replace(tzinfo=None)
+        plan = copy.deepcopy(self.plan)
+        # pretend tonight's plan was made at 22:00 today, for tomorrow
+        plan["sim"]["start"] = now.replace(hour=22, minute=0, second=0, microsecond=0).isoformat()
+        plan["sim"]["tomorrow"] = plan["for_date"] = (now.date() + dt.timedelta(days=1)).isoformat()
+        plan["weekday"] = planner.DAYS[(now.date() + dt.timedelta(days=1)).weekday()]
+        self.assertTrue(planner.today_tail_available(plan))
+        ha = self.fake()
+        old_today = [b[2] for b in plan["sim"]["fixed"]]
+        tv = list(old_today); tv[6] = 20.5                          # 22:00-24:00 never ends before midnight
+        offs = [b[2] for b in plan["sim"]["fixed_off"]]; offs[6] = -2
+        new, pushed = planner.push_today(ha, self.cfg, plan, tv, offs)
+        self.assertTrue(pushed["verified"])
+        today_name = planner.DAYS[now.weekday()]
+        self.assertEqual(ha.helper[today_name][-1]["data"], {"temperature": 20.5, "lwt_offset": -2})
+        self.assertEqual(new["blocks"], plan["blocks"])                 # tomorrow untouched
+        self.assertEqual(new["sim"]["fixed"][6][2], 20.5)
+        if now.hour >= 4:                                               # 00:00-04:00 has ended: refuse
+            bad = list(tv); bad[0] = old_today[0] + 1
+            with self.assertRaises(ValueError):
+                planner.push_today(ha, self.cfg, new, bad, offs)
+        with self.assertRaises(ValueError):                             # plan for today: use the normal editor
+            planner.push_today(ha, self.cfg, self.plan, tv, offs)
+        data.save_json("plan_latest.json", self.plan)
 
     def test_comfort_hours_and_grid_meter(self):
         for r in self.plan["strategies"].values():

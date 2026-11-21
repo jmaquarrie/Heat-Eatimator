@@ -16,7 +16,7 @@ Python stdlib only. Runs on LXC 122 as `heatplanner-web` (port 8110) plus two ti
 | Status chips | Plan pushed and verified, whether the thermostat is following the plan, Daikin API calls left, live grid power (if a meter is configured) |
 | Now | Room now against target and against what the model predicted, the next setpoint change, today's setpoints with a "now" marker, tariff now and next, battery, outside, heating state |
 | Plan | Headline in real pounds with comfort kept separate, plus a shared-time chart: room against setpoint and comfort floors, outside temperature, pump kWh per hour, battery, Cosy and Peak shading, hover readout. **Drag the handles** on the setpoint line to try changes |
-| Edit | ±0.5 °C per block with instant re-simulation (`/api/simulate`, no HA calls); push with confirmation; **undo** puts the optimiser's plan back |
+| Edit | ±0.5 °C and water offset per block with instant re-simulation (`/api/simulate`, no HA calls); push with confirmation; **undo** puts the optimiser's plan back. Edits **today** too: blocks that have ended are locked (the server refuses changes to them), and after 22:00 a Today/Tomorrow switch lets you change the rest of tonight without touching tomorrow's plan |
 | Compare | Strategy cards led by electricity in pounds and comfort as "time below 19.5°"; the model score and its breakdown are folded away under "How the planner scores a plan" |
 | Week | Six-day preview: electricity per day against routine, comfort, setpoint strip |
 | Who's home | Weekly pattern plus a two-week calendar; tap a day to cycle Home, Out and Away |

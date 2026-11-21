@@ -467,7 +467,8 @@ def do_simulate(body):
     if not plan:
         return 404, json.dumps({"error": "no plan yet"}), "application/json"
     try:
-        return 200, json.dumps(planner.simulate_values(data.load_config(), plan, body.get("values"), body.get("offsets"))), "application/json"
+        return 200, json.dumps(planner.simulate_values(data.load_config(), plan, body.get("values"), body.get("offsets"),
+                                                       body.get("today_values"), body.get("today_offsets"))), "application/json"
     except ValueError as e:
         return 400, json.dumps({"error": str(e)}), "application/json"
 
@@ -498,6 +499,16 @@ def do_push(body):
     with RUN_LOCK:
         if RUN["state"] == "running":
             return 409, json.dumps({"error": "the model is re-running; try again in a minute"}), "application/json"
+    if body.get("day") == "today":
+        try:
+            new, pushed = planner.push_today(_ha(), data.load_config(), plan, body.get("today_values"), body.get("today_offsets"))
+        except ValueError as e:
+            return 400, json.dumps({"error": str(e)}), "application/json"
+        STATUS_CACHE["at"] = 0
+        with open(data.path("log.jsonl"), "a") as f:
+            f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "event": "manual_push_today",
+                                "blocks": new["today_edit"]["blocks"], "verified": pushed["verified"]}) + "\n")
+        return 200, json.dumps({"pushed": pushed, "blocks": new["today_edit"]["blocks"]}), "application/json"
     try:
         new = planner.push_values(_ha(), data.load_config(), plan, body.get("values"), body.get("offsets"))
     except ValueError as e:

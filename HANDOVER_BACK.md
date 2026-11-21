@@ -68,6 +68,11 @@ diff /tmp/base_planner.py /tmp/live_planner.py && echo "live code matches the ba
 - **Edit:** a ±0.5 °C setpoint and ±1 water offset per block, re-simulated instantly through `/api/simulate`
   (no HA calls). "Push to Home Assistant" writes only the plan's weekday in `schedule.heat_pump_planner`,
   after a confirmation. "Undo" (`/api/restore`) puts the optimiser's choice back.
+  **Today's routine can be edited for blocks not yet ended.** During the day the plan is for today, so the
+  editor locks ended blocks, and `push_values` refuses changes to them. After 22:00 (the plan is for
+  tomorrow) a Today/Tomorrow switch appears: "Today" posts `{"day":"today", "today_values", "today_offsets"}`
+  to `/api/push`, which calls `planner.push_today()`. That writes only today's weekday in the helper, updates
+  the plan's `sim.fixed`, and leaves tomorrow's plan alone.
 - **Compare:** strategy cards led by electricity in pounds and comfort as "time below 19.5°". The model score
   is folded away.
 - **Who's home:** weekly pattern plus a two-week tap-to-cycle calendar (same `/api/occupancy` as before).

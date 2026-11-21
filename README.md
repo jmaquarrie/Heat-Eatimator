@@ -79,9 +79,9 @@ profitable.
 
 ## Battery and other entities
 
-* The battery discharge limit is read at plan time from `battery.discharge_limit_entity`
-  (`number.marstek_m1_max_discharge_power`, currently 900 W), so the model no longer assumes
-  2.5 kW of cover. Charge and discharge limits are separate (`max_charge_kw`, `max_discharge_kw`).
+* The battery is modelled at 2.5 kW charge and discharge (it is managed in the Anker app, not HA).
+  Limits are separate settings (`max_charge_kw`, `max_discharge_kw`); `battery.discharge_limit_entity`
+  can point at a live limit if that ever changes.
 * Stored every data run for later learning: battery state of charge, charging and discharging power
   (`sensor.anker_solix_battery_charging_power` / `_discharging_power`).
 * Grid meter defaults: `sensor.octopus_energy_electricity_…_current_total_consumption` (Home Mini,

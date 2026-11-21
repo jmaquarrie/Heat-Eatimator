@@ -34,7 +34,7 @@ class FakeHA:
 
     def state(self, eid):
         return {"state": {"sensor.heat_pump_climate_control_room_temperature": "19.6",
-                          "number.marstek_m1_max_discharge_power": "900"}.get(eid, "62"),
+                          }.get(eid, "62"),
                 "attributes": {"temperature": 0, "min_temp": -10, "max_temp": 10} if eid.endswith("leaving_water_offset") else {}}
 
     def schedule_list(self):

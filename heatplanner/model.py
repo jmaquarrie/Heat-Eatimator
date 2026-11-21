@@ -58,10 +58,10 @@ DEFAULT_CONFIG = {
         "peak": [[16, 19]],
         "rate_cosy": 0.140651, "rate_standard": 0.286808, "rate_peak": 0.430212,
     },
-    # max_charge_kw / max_discharge_kw can differ; the discharge limit is re-read at plan time from
-    # discharge_limit_entity (W) when set (Anker/Marstek "Max. Discharge Power").
+    # Anker Solix, managed in the Anker app (not HA): 2.5 kW each way. discharge_limit_entity (W) can be set
+    # to re-read a live limit at plan time; left empty because the HA battery helpers are not in use.
     "battery": {"capacity_kwh": 10.0, "reserve_kwh": 1.0, "max_kw": 2.5, "max_charge_kw": 2.5, "max_discharge_kw": 2.5,
-                "rte": 0.90, "discharge_limit_entity": "number.marstek_m1_max_discharge_power"},
+                "rte": 0.90, "discharge_limit_entity": ""},
     "house_load_kw": 0.25,
     "comfort": {
         "target_c": 20.0,          # you said 20 feels comfortable

@@ -16,7 +16,7 @@ Python stdlib only. Runs on LXC 122 as `heatplanner-web` (port 8110) plus two ti
 | Status chips | Plan pushed and verified, whether the thermostat is following the plan, Daikin API calls left, live grid power (if a meter is configured) |
 | Now | Room now against target and against what the model predicted, the next setpoint change, today's setpoints with a "now" marker, tariff now and next, battery, outside, heating state |
 | Plan | Headline in real pounds with comfort kept separate, plus a shared-time chart: room against setpoint and comfort floors, outside temperature, pump kWh per hour, battery, Cosy and Peak shading, hover readout. **Drag the handles** on the setpoint line to try changes |
-| Edit | ±0.5 °C per block with instant re-simulation (`/api/simulate`, no HA calls); push with confirmation; **undo** puts the optimiser's plan back |
+| Edit | ±0.5 °C and water offset per block with instant re-simulation (`/api/simulate`, no HA calls); push with confirmation; **undo** puts the optimiser's plan back. Shows the **next day** by default. A day picker (and clicking a Week card) opens any week-ahead day; pushing one **pins** the edit, which the 22:00 run the night before keeps. **Edit today's plan** on the Now card opens today, with blocks that have ended locked |
 | Compare | Strategy cards led by electricity in pounds and comfort as "time below 19.5°"; the model score and its breakdown are folded away under "How the planner scores a plan" |
 | Week | Six-day preview: electricity per day against routine, comfort, setpoint strip |
 | Who's home | Weekly pattern plus a two-week calendar; tap a day to cycle Home, Out and Away |
@@ -95,9 +95,10 @@ profitable.
 | GET | `/api/plan`, `/api/params`, `/api/plans`, `/api/config`, `/api/log` | stored JSON |
 | GET | `/api/status` | live HA readings (REST reads only; no Daikin cloud calls) |
 | GET | `/api/actuals?date=YYYY-MM-DD` | measured hourly room / kWh beside that day's prediction (default yesterday) |
-| POST | `/api/simulate` `{"values":[7 setpoints], "offsets":[7]}` | what-if, read-only; offsets optional |
-| POST | `/api/push` `{"values":[...], "offsets":[...]}` | writes the plan's weekday in `schedule.heat_pump_planner` only |
-| POST | `/api/restore` | undo a hand edit: re-push the strategy the planner had chosen |
+| POST | `/api/simulate` `{"date", "values":[7 setpoints], "offsets":[7]}` | what-if for any editable day, read-only |
+| POST | `/api/push` `{"date", "values", "offsets"}` | writes that day's weekday in `schedule.heat_pump_planner` only (week-ahead days are also pinned in `data/day_overrides.json`) |
+| GET | `/api/day?date=` | plan-shaped view of any editable day (the plan day, the rest of today, a week-ahead day) |
+| POST | `/api/restore` `{"date"}` | undo a hand edit: re-push the planner's choice (for a week-ahead day, drop the pin) |
 | POST | `/api/occupancy`, `/api/rerun` | as before |
 
 Optional: set `HEATPLANNER_WRITE_KEY=...` in `/etc/heatplanner.env` to require a key for the POST

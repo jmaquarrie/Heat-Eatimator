@@ -467,19 +467,43 @@ def do_simulate(body):
     if not plan:
         return 404, json.dumps({"error": "no plan yet"}), "application/json"
     try:
-        return 200, json.dumps(planner.simulate_values(data.load_config(), plan, body.get("values"), body.get("offsets"))), "application/json"
-    except ValueError as e:
-        return 400, json.dumps({"error": str(e)}), "application/json"
+        cfg = data.load_config()
+        if body.get("date"):   # any editable day: plan day, rest of today, or a week-ahead day
+            return 200, json.dumps(planner.simulate_for_date(cfg, plan, body["date"], body.get("values"), body.get("offsets"))), "application/json"
+        return 200, json.dumps(planner.simulate_values(cfg, plan, body.get("values"), body.get("offsets"),
+                                                       body.get("today_values"), body.get("today_offsets"))), "application/json"
+    except (ValueError, StopIteration) as e:
+        return 400, json.dumps({"error": str(e) or "no such day"}), "application/json"
+
+
+def do_day(date_s):
+    plan = data.load_json("plan_latest.json", None)
+    if not plan:
+        return 404, json.dumps({"error": "no plan yet"}), "application/json"
+    try:
+        return 200, json.dumps(planner.day_view(data.load_config(), plan, date_s)), "application/json"
+    except (ValueError, StopIteration) as e:
+        return 400, json.dumps({"error": str(e) or "no such day"}), "application/json"
+
+
+def _log(event, **kw):
+    with open(data.path("log.jsonl"), "a") as f:
+        f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "event": event, **kw}) + "\n")
 
 
 def do_restore(body):
     plan = data.load_json("plan_latest.json", None)
     if not plan:
         return 404, json.dumps({"error": "no plan yet"}), "application/json"
+    d = body.get("date")
     try:
+        if d and planner.day_kind(plan, d) == "outlook":
+            pushed, blocks = planner.restore_future(_ha(), data.load_config(), plan, d)
+            _log("manual_undo_future", date=d, verified=pushed["verified"])
+            return 200, json.dumps({"pushed": pushed, "blocks": blocks}), "application/json"
         new = planner.restore_plan(_ha(), data.load_config(), plan)
-    except ValueError as e:
-        return 400, json.dumps({"error": str(e)}), "application/json"
+    except (ValueError, StopIteration) as e:
+        return 400, json.dumps({"error": str(e) or "no such day"}), "application/json"
     STATUS_CACHE["at"] = 0
     try:
         planner.publish_sensors(_ha(), data.load_config(), new)
@@ -498,6 +522,30 @@ def do_push(body):
     with RUN_LOCK:
         if RUN["state"] == "running":
             return 409, json.dumps({"error": "the model is re-running; try again in a minute"}), "application/json"
+    d = body.get("date")
+    try:
+        kind = planner.day_kind(plan, d) if d else None
+    except (ValueError, StopIteration) as e:
+        return 400, json.dumps({"error": str(e) or "no such day"}), "application/json"
+    if kind == "outlook":
+        try:
+            pushed, blocks = planner.push_future(_ha(), data.load_config(), plan, d, body.get("values"), body.get("offsets"))
+        except ValueError as e:
+            return 400, json.dumps({"error": str(e)}), "application/json"
+        _log("manual_push_future", date=d, blocks=blocks, verified=pushed["verified"])
+        return 200, json.dumps({"pushed": pushed, "blocks": blocks}), "application/json"
+    if kind == "today_tail":
+        body = {"day": "today", "today_values": body.get("values"), "today_offsets": body.get("offsets")}
+    if body.get("day") == "today":
+        try:
+            new, pushed = planner.push_today(_ha(), data.load_config(), plan, body.get("today_values"), body.get("today_offsets"))
+        except ValueError as e:
+            return 400, json.dumps({"error": str(e)}), "application/json"
+        STATUS_CACHE["at"] = 0
+        with open(data.path("log.jsonl"), "a") as f:
+            f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "event": "manual_push_today",
+                                "blocks": new["today_edit"]["blocks"], "verified": pushed["verified"]}) + "\n")
+        return 200, json.dumps({"pushed": pushed, "blocks": new["today_edit"]["blocks"]}), "application/json"
     try:
         new = planner.push_values(_ha(), data.load_config(), plan, body.get("values"), body.get("offsets"))
     except ValueError as e:
@@ -554,7 +602,15 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, json.dumps(public_config()), "application/json")
             if p == "/api/log":
                 return self.send(200, json.dumps(recent_log()), "application/json")
-            m = {"/api/plan": "plan_latest.json", "/api/params": "params.json", "/api/plans": "plans_index.json"}
+            if p == "/api/plan":
+                plan = data.load_json("plan_latest.json", {})
+                if plan.get("outlook"):
+                    planner.annotate_outlook(data.load_config(), plan)
+                return self.send(200, json.dumps(plan), "application/json")
+            if p == "/api/day":
+                from urllib.parse import parse_qs
+                return self.send(*do_day((parse_qs(u.query).get("date") or [""])[0]))
+            m = {"/api/params": "params.json", "/api/plans": "plans_index.json"}
             if p in m:
                 return self.send(200, json.dumps(data.load_json(m[p], {})), "application/json")
             if p == "/api/rerun-status":

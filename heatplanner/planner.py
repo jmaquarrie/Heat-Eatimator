@@ -225,6 +225,17 @@ def build_plan(ha, cfg, params, now=None, wx=None):
     # stability rule: only deviate from the current routine if it saves at least 2p
     if results["Current routine"]["total"] - results["Optimised"]["total"] < 0.02:
         chosen_name = "Current routine"
+    # a day the owner edited in advance (week ahead) keeps their edit instead of being re-optimised
+    pinned = load_overrides().get(tomorrow.isoformat())
+    manual = None
+    if pinned:
+        p_vals = check_values(cfg, pinned["values"])
+        p_offs = None
+        if use_off:
+            p_offs = [round(float(o)) for o in (pinned.get("offsets") or cur_offs)]
+        results["Your edit"] = summary(p_vals, p_offs, ev(p_vals, p_offs))
+        manual = {"at": pinned.get("at"), "values": p_vals, "previous": chosen_name, "pinned": True}
+        chosen_name = "Your edit"
     chosen_vals, chosen_offs = results[chosen_name]["values"], results[chosen_name]["offsets"]
     tm = [(t, v) for t, v in fc if t.date() == tomorrow]
     compare = {}
@@ -261,6 +272,8 @@ def build_plan(ha, cfg, params, now=None, wx=None):
                       "week": [{"date": (today + dt.timedelta(days=i)).isoformat(), "weekday": DAYS[(today + dt.timedelta(days=i)).weekday()],
                                 "status": model.day_status(cfg, today + dt.timedelta(days=i))} for i in range(0, 8)]},
     }
+    if manual:
+        plan["manual"] = manual
     plan["outlook"] = build_outlook(ha, cfg, params, wx, ctx["start_dt"], chosen_vals, cur_off if use_off else None, ocands)
     # everything needed to re-run the simulation later without Home Assistant (dashboard what-if editor)
     plan["sim"] = {"start": ctx["start_dt"].isoformat(), "hours": ctx["hours"], "t_room0": ctx["t_room0"],
@@ -333,14 +346,44 @@ def plan_offsets(plan):
     return None
 
 
-def simulate_values(cfg, plan, values, offsets=None):
-    """What-if: simulate the planned day with the given block setpoints (and offsets). No HA access needed."""
+def ended_blocks(cfg, date, now=None):
+    """Indices of cfg blocks that have already finished on `date` (all of them for a past date)."""
+    now = now or dt.datetime.now(LOCAL).replace(tzinfo=None)
+    if date > now.date():
+        return set()
+    if date < now.date():
+        return set(range(len(cfg["blocks"])))
+    h = now.hour + now.minute / 60
+    return {i for i, (a, b) in enumerate(cfg["blocks"]) if b <= h}
+
+
+def check_unchanged(cfg, ended, old_vals, new_vals, old_offs=None, new_offs=None):
+    for i in sorted(ended):
+        a, b = cfg["blocks"][i]
+        if abs(old_vals[i] - new_vals[i]) > 1e-9 or (old_offs is not None and new_offs is not None and old_offs[i] != new_offs[i]):
+            raise ValueError("%02d:00-%02d:00 has already ended and can't be changed" % (a, b))
+
+
+def today_tail_available(plan):
+    """True when the plan is for tomorrow and was made today, so the rest of today is held in sim.fixed."""
+    s = plan.get("sim") or {}
+    today = dt.datetime.now(LOCAL).date().isoformat()
+    return bool(s.get("fixed")) and s.get("start", "")[:10] == today and plan["for_date"] != today
+
+
+def simulate_values(cfg, plan, values, offsets=None, today_values=None, today_offsets=None):
+    """What-if: simulate the planned day with the given block setpoints (and offsets). No HA access needed.
+    today_values / today_offsets replace the rest of today (the start-day blocks) instead."""
     values = check_values(cfg, values)
     ctx, fixed, params, _, fixed_off = sim_context(cfg, plan)
     if fixed_off is not None:
         offsets = check_offsets(cfg, plan, offsets) if offsets is not None else (plan_offsets(plan) or [0] * len(values))
     else:
         offsets = None
+    if today_values is not None:
+        fixed = model.blocks_from_values(cfg, check_values(cfg, today_values))
+        if fixed_off is not None and today_offsets is not None:
+            fixed_off = model.blocks_from_values(cfg, check_offsets(cfg, plan, today_offsets))
     r = model.evaluate(cfg, params, ctx, fixed, values, trace=True, offsets=offsets, fixed_off=fixed_off)
     out = {k: r[k] for k in SUMMARY_KEYS}
     out.update({"values": values, "offsets": offsets,
@@ -354,6 +397,9 @@ def push_values(ha, cfg, plan, values, offsets=None):
     if dt.date.fromisoformat(plan["for_date"]) < dt.datetime.now(LOCAL).date():
         raise ValueError("the latest plan is for %s, which has passed; re-run the model first" % plan["for_date"])
     res = simulate_values(cfg, plan, values, offsets)
+    # blocks of the plan's day that have already ended (when the plan is for today) can't change
+    check_unchanged(cfg, ended_blocks(cfg, dt.date.fromisoformat(plan["for_date"])), [b["temperature"] for b in plan["blocks_raw"]],
+                    res["values"], plan_offsets(plan), res["offsets"])
     previous = (plan.get("manual") or {}).get("previous") if plan["chosen"] == "Your edit" else plan["chosen"]
     plan = dict(plan)
     plan["blocks"] = res["blocks"]
@@ -463,12 +509,223 @@ def validate(cfg, blocks):
             raise ValueError("gap/overlap in blocks")
 
 
+# ------------------------------------------------------------------ any day: today, plan day, week ahead
+OVERRIDES = "day_overrides.json"
+
+
+def load_overrides():
+    """Hand edits pinned to future dates: {date: {values, offsets, at}}. Past dates are dropped."""
+    today = dt.datetime.now(LOCAL).date().isoformat()
+    return {k: v for k, v in data.load_json(OVERRIDES, {}).items() if k >= today}
+
+
+def save_overrides(ov):
+    data.save_json(OVERRIDES, ov)
+
+
+def _sample_blocks(cfg, blocks, key, default):
+    out = []
+    for a, b in cfg["blocks"]:
+        v = default
+        for blk in blocks:
+            if blk["from"] <= a < blk["to"] and blk.get(key) is not None:
+                v = blk[key]
+        out.append(v)
+    return out
+
+
+def day_kind(plan, date_iso):
+    today = dt.datetime.now(LOCAL).date().isoformat()
+    if date_iso == plan["for_date"]:
+        return "plan"
+    if date_iso == today and today_tail_available(plan):
+        return "today_tail"
+    if plan.get("sim") and any(o.get("date") == date_iso and "error" not in o for o in plan.get("outlook") or []):
+        if date_iso < today:
+            raise ValueError("%s has passed" % date_iso)
+        return "outlook"
+    raise ValueError("no plan for %s" % date_iso)
+
+
+def outlook_ctx(cfg, plan, date_iso):
+    """Rebuild the week-ahead simulation context for one day (same assumptions as build_outlook)."""
+    s = plan["sim"]
+    params = model.deep_merge(model.DEFAULT_PARAMS, s["params"])
+    wx = [(dt.datetime.fromisoformat(t), {"t": c, "rad": r}) for t, c, r in s["wx"]]
+    day = dt.date.fromisoformat(date_iso)
+    start = dt.datetime.combine(day - dt.timedelta(days=1), dt.time(22, 0))
+    end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(4, 0))
+    ctx = {"start_dt": start, "hours": (end - start).total_seconds() / 3600, "t_room0": 19.8,
+           "soc0_kwh": cfg["battery"]["reserve_kwh"] + 3, "tomorrow": day, "terminal_ref_c": 19.5,
+           "outdoor": data.series_fn(wx, "t", params.get("outdoor_bias_c", 0.0)), "radiation": data.series_fn(wx, "rad")}
+    steady = [cfg["comfort"]["target_c"]] * len(cfg["blocks"])
+    fixed = model.blocks_from_values(cfg, steady)
+    use_off = bool(s.get("fixed_off"))
+    cur = (plan.get("lwt_offset") or {}).get("current", 0) if use_off else None
+    fixed_off = model.blocks_from_values(cfg, [cur] * len(cfg["blocks"])) if use_off else None
+    tm = [v["t"] for t, v in wx if t.date() == day]
+    fc = {"min": round(min(tm), 1), "max": round(max(tm), 1), "mean": round(sum(tm) / len(tm), 1)} if tm else {"min": 0, "max": 0, "mean": 0}
+    return ctx, fixed, fixed_off, params, cur, fc
+
+
+def _sim_out(cfg, r, values, offsets, exact=True):
+    out = {k: r[k] for k in SUMMARY_KEYS}
+    out.update({"values": values, "offsets": offsets,
+                "trace": [{k: x[k] for k in ("t", "room", "target", "el_kw", "soc", "cum", "lwt", "off")} for x in r["trace"]],
+                "blocks": plan_blocks(cfg, values, offsets), "exact": exact})
+    return out
+
+
+def day_view(cfg, plan, date_iso):
+    """A plan-shaped object for any editable day, so the dashboard can show and edit it like the main plan."""
+    kind = day_kind(plan, date_iso)
+    if kind == "plan":
+        return {"kind": "plan", "for_date": date_iso}
+    routine = (plan.get("sim") or {}).get("current") or plan["strategies"]["Current routine"]["values"]
+    if kind == "today_tail":
+        ctx, fixed, params, _, fixed_off = sim_context(cfg, plan)
+        vals = [b[2] for b in fixed]
+        offs = [b[2] for b in fixed_off] if fixed_off else None
+        pv, po = [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan)
+        r = model.evaluate(cfg, params, ctx, fixed, pv, trace=True, offsets=po, fixed_off=fixed_off)
+        rr = model.evaluate(cfg, params, ctx, model.blocks_from_values(cfg, routine), pv, trace=True, offsets=po,
+                            fixed_off=model.blocks_from_values(cfg, [offs[0] if offs else 0] * len(routine)) if offs else None)
+        strategies = {"Current plan": {"values": vals, "offsets": offs, **{k: r[k] for k in SUMMARY_KEYS}},
+                      "Current routine": {"values": routine, "offsets": [offs[0]] * len(routine) if offs else None, **{k: rr[k] for k in SUMMARY_KEYS}}}
+        today = dt.date.fromisoformat(date_iso)
+        fc = plan["forecast_tomorrow"]
+        return {"kind": kind, "for_date": date_iso, "chosen": "Current plan", "strategies": strategies,
+                "blocks": plan_blocks(cfg, vals, offs), "blocks_raw": plan_blocks(cfg, vals, offs, raw=True),
+                "trace_best": r["trace"], "trace_current": rr["trace"], "start": plan["start"], "t_room0": plan["t_room0"],
+                "soc0_kwh": plan["soc0_kwh"], "forecast_tomorrow": fc, "occupancy": {"status_tomorrow": model.day_status(cfg, today)},
+                "lwt_offset": plan.get("lwt_offset"), "battery": plan.get("battery"), "pushed": plan.get("today_edit"), "manual": None,
+                "note": "The rest of today. Tomorrow's plan is left as it is."}
+    # week ahead
+    ctx, fixed, fixed_off, params, cur, fc = outlook_ctx(cfg, plan, date_iso)
+    o = next(x for x in plan["outlook"] if x.get("date") == date_iso)
+    use_off = fixed_off is not None
+    ov = load_overrides().get(date_iso)
+    opt_v = _sample_blocks(cfg, o["blocks"], "temperature", cfg["comfort"]["target_c"])
+    opt_o = [round(x) for x in _sample_blocks(cfg, o["blocks"], "lwt_offset", cur)] if use_off else None
+    cur_o = [cur] * len(routine) if use_off else None
+    ev = lambda v, of: model.evaluate(cfg, params, ctx, fixed, v, trace=True, offsets=of, fixed_off=fixed_off)
+    r_opt, r_cur = ev(opt_v, opt_o), ev(routine, cur_o)
+    strategies = {"Optimised": {"values": opt_v, "offsets": opt_o, **{k: r_opt[k] for k in SUMMARY_KEYS}},
+                  "Current routine": {"values": routine, "offsets": cur_o, **{k: r_cur[k] for k in SUMMARY_KEYS}}}
+    chosen, best = "Optimised", r_opt
+    manual = None
+    if ov:
+        ev_v = check_values(cfg, ov["values"])
+        ev_o = [round(float(x)) for x in (ov.get("offsets") or opt_o)] if use_off else None
+        r_ed = ev(ev_v, ev_o)
+        strategies["Your edit"] = {"values": ev_v, "offsets": ev_o, **{k: r_ed[k] for k in SUMMARY_KEYS}}
+        chosen, best = "Your edit", r_ed
+        manual = {"at": ov.get("at"), "previous": "Optimised", "pinned": True}
+    sv, so = strategies[chosen]["values"], strategies[chosen]["offsets"]
+    return {"kind": kind, "for_date": date_iso, "chosen": chosen, "strategies": strategies,
+            "blocks": plan_blocks(cfg, sv, so), "blocks_raw": plan_blocks(cfg, sv, so, raw=True),
+            "trace_best": best["trace"], "trace_current": r_cur["trace"], "start": ctx["start_dt"].isoformat(),
+            "t_room0": ctx["t_room0"], "soc0_kwh": ctx["soc0_kwh"], "forecast_tomorrow": fc,
+            "occupancy": {"status_tomorrow": model.day_status(cfg, dt.date.fromisoformat(date_iso))},
+            "lwt_offset": plan.get("lwt_offset"), "battery": plan.get("battery"),
+            "pushed": (ov or {}).get("pushed"), "manual": manual,
+            "note": "Week-ahead preview: assumes the room is 19.8° at 22:00 the night before. The planner re-plans this day at 22:00 the night before, and keeps a pinned edit if you push one."}
+
+
+def simulate_for_date(cfg, plan, date_iso, values, offsets=None):
+    kind = day_kind(plan, date_iso)
+    if kind == "plan":
+        return simulate_values(cfg, plan, values, offsets)
+    if kind == "today_tail":
+        return simulate_values(cfg, plan, [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan),
+                               today_values=values, today_offsets=offsets)
+    ctx, fixed, fixed_off, params, cur, _ = outlook_ctx(cfg, plan, date_iso)
+    values = check_values(cfg, values)
+    offsets = (check_offsets(cfg, plan, offsets) if offsets is not None else [cur] * len(values)) if fixed_off is not None else None
+    r = model.evaluate(cfg, params, ctx, fixed, values, trace=True, offsets=offsets, fixed_off=fixed_off)
+    return _sim_out(cfg, r, values, offsets)
+
+
+def push_future(ha, cfg, plan, date_iso, values, offsets=None):
+    """Pin a hand edit to a week-ahead day and write that weekday in the helper now."""
+    if day_kind(plan, date_iso) != "outlook":
+        raise ValueError("not a week-ahead day")
+    res = simulate_for_date(cfg, plan, date_iso, values, offsets)
+    blocks = res["blocks"]
+    validate(cfg, blocks)
+    day = dt.date.fromisoformat(date_iso)
+    pushed = push_day(ha, cfg, DAYS[day.weekday()], blocks)
+    ov = load_overrides()
+    ov[date_iso] = {"values": res["values"], "offsets": res["offsets"], "at": pushed["at"], "pushed": pushed}
+    save_overrides(ov)
+    return pushed, blocks
+
+
+def restore_future(ha, cfg, plan, date_iso):
+    """Drop a pinned edit for a week-ahead day and write the planner's preview back to that weekday."""
+    ov = load_overrides()
+    if date_iso not in ov:
+        raise ValueError("there is no edit to undo for %s" % date_iso)
+    del ov[date_iso]
+    save_overrides(ov)
+    o = next(x for x in plan["outlook"] if x.get("date") == date_iso)
+    day = dt.date.fromisoformat(date_iso)
+    pushed = push_day(ha, cfg, DAYS[day.weekday()], o["blocks"])
+    return pushed, o["blocks"]
+
+
+def annotate_outlook(cfg, plan):
+    """Mark week-ahead days that carry a pinned edit (for the dashboard's week cards)."""
+    ov = load_overrides()
+    for o in plan.get("outlook") or []:
+        if o.get("date") in ov and "error" not in o:
+            try:
+                v = day_view(cfg, plan, o["date"])
+                ed = v["strategies"]["Your edit"]
+                o.update({"edited": True, "blocks": v["blocks"], "grid_cost": round(ed["grid_cost"], 2),
+                          "total": round(ed["total"], 2), "hours_below": round(ed["hours_below"], 2), "kwh_hp": round(ed["kwh_hp"], 1)})
+            except Exception:
+                pass
+    return plan
+
+
+def push_today(ha, cfg, plan, values, offsets=None):
+    """After 22:00 the plan is for tomorrow; this changes the rest of TODAY in the helper (blocks not yet
+    ended), leaving tomorrow's plan as it is. Records the change in the plan's sim block."""
+    if not today_tail_available(plan):
+        raise ValueError("today is the plan's own day: edit it in the normal editor")
+    s = plan["sim"]
+    old_vals = [b[2] for b in s["fixed"]]
+    old_offs = [b[2] for b in s["fixed_off"]] if s.get("fixed_off") else None
+    res = simulate_values(cfg, plan, [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan),
+                          today_values=values, today_offsets=offsets if old_offs is not None else None)
+    new_vals = check_values(cfg, values)
+    new_offs = check_offsets(cfg, plan, offsets) if (old_offs is not None and offsets is not None) else old_offs
+    today = dt.datetime.now(LOCAL).date()
+    check_unchanged(cfg, ended_blocks(cfg, today), old_vals, new_vals, old_offs, new_offs)
+    blocks = plan_blocks(cfg, new_vals, new_offs)
+    validate(cfg, blocks)
+    pushed = push_day(ha, cfg, DAYS[today.weekday()], blocks)
+    plan = dict(plan)
+    plan["sim"] = dict(s, fixed=[[a, b, v] for (a, b), v in zip(cfg["blocks"], new_vals)],
+                       fixed_off=[[a, b, o] for (a, b), o in zip(cfg["blocks"], new_offs)] if new_offs is not None else s.get("fixed_off"))
+    plan["fixed_today_tail"] = [{"from": a, "to": b, "temperature": v} for (a, b), v in zip(cfg["blocks"], new_vals) if b > 20]
+    plan["today_edit"] = {"at": pushed["at"], "date": today.isoformat(), "blocks": blocks, "verified": pushed["verified"],
+                          "total": res["total"], "grid_cost": res["grid_cost"]}
+    save_plan(plan)
+    return plan, pushed
+
+
 def push(ha, cfg, plan):
     validate(cfg, plan["blocks"])
+    return push_day(ha, cfg, plan["weekday"], plan["blocks"])
+
+
+def push_day(ha, cfg, day, blocks):
+    """Write one weekday of the planner helper (all seven days are sent, as the websocket API needs) and verify."""
     helper, created = ensure_helper(ha, cfg)
-    day = plan["weekday"]
     new = {k: v for k, v in helper.items() if k in DAYS}
-    new[day] = blocks_to_helper([(b["from"], b["to"], b["temperature"], b.get("lwt_offset")) for b in plan["blocks"]])
+    new[day] = blocks_to_helper([(b["from"], b["to"], b["temperature"], b.get("lwt_offset")) for b in blocks])
     ha.schedule_update(helper["id"], {"name": helper.get("name", cfg["schedule_name"]), "icon": helper.get("icon", "mdi:heat-pump"), **{d: new.get(d, []) for d in DAYS}})
     back = get_helper(ha, cfg)
     ok = back and back.get(day) == new[day]

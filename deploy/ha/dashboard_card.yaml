@@ -1,0 +1,29 @@
+# Optional Lovelace card showing the planner inside Home Assistant.
+# The sensor.heatplanner_* entities are written by the planner after every run
+# (set "publish_sensors": false in /opt/heatplanner/data/config.json to stop that).
+# They live only in HA's state machine: after an HA restart they reappear at the next plan.
+type: vertical-stack
+cards:
+  - type: entities
+    title: Heat planner
+    entities:
+      - entity: sensor.heatplanner_status
+        name: Plan
+        secondary_info: last-updated
+      - entity: sensor.heatplanner_saving
+        name: Saving vs routine (model)
+      - entity: sensor.heatplanner_cost
+        name: Predicted electricity
+      - entity: sensor.heatplanner_kwh
+        name: Predicted pump kWh
+      - entity: sensor.heatplanner_min_temp
+        name: Coldest while awake
+      - entity: schedule.heat_pump_planner
+        name: Planner schedule now
+        type: attribute
+        attribute: temperature
+        suffix: "°C"
+  # Full dashboard in a panel (works on the LAN; use the NPM hostname if you proxy it):
+  - type: iframe
+    url: http://192.168.1.152:8110/
+    aspect_ratio: 160%

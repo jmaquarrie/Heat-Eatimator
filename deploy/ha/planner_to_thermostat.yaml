@@ -1,0 +1,47 @@
+# Home Assistant automation: make the Daikin thermostat follow schedule.heat_pump_planner.
+#
+# Paste into Settings > Automations > (new) > Edit in YAML, review, then save.
+# It is NOT installed by the planner. Nothing here touches schedule.heat_pump_schedule_2.
+#
+# Daikin cloud budget: about 200 calls a day, about 35 spare. This automation:
+#   * writes only when the planned value differs from the current setpoint by 0.5 C or more,
+#   * writes at most once every 55 minutes (mode: single + last_triggered check),
+#   * skips when the gateway reports fewer than 15 calls left today,
+#   * does nothing when the planner schedule has no active block (state off / no temperature).
+# Typical plans have 4-7 blocks, so that's 4-7 writes a day at most.
+# The hourly :05 trigger is a catch-up in case a change was skipped by the 55-minute rule; it
+# costs nothing when the setpoint already matches.
+
+alias: Heat planner -> thermostat
+description: Follow schedule.heat_pump_planner on the Altherma room setpoint (rate limited).
+mode: single
+triggers:
+  - trigger: state
+    entity_id: schedule.heat_pump_planner
+  - trigger: state
+    entity_id: schedule.heat_pump_planner
+    attribute: temperature
+  - trigger: time_pattern
+    minutes: "5"
+conditions:
+  - condition: template
+    value_template: >
+      {% set want = state_attr('schedule.heat_pump_planner', 'temperature') %}
+      {% set have = state_attr('climate.altherma_room_temperature', 'temperature') %}
+      {{ is_state('schedule.heat_pump_planner', 'on')
+         and want is not none and have is not none
+         and (want | float(0) - have | float(0)) | abs >= 0.5
+         and 16 <= want | float(0) <= 22 }}
+  - condition: template
+    value_template: >
+      {% set last = this.attributes.last_triggered %}
+      {{ last is none or (now() - last).total_seconds() > 3300 }}
+  - condition: template
+    value_template: >
+      {{ states('sensor.altherma_gateway_ratelimit_remaining_day') | float(99) >= 15 }}
+actions:
+  - action: climate.set_temperature
+    target:
+      entity_id: climate.altherma_room_temperature
+    data:
+      temperature: "{{ state_attr('schedule.heat_pump_planner', 'temperature') | float }}"

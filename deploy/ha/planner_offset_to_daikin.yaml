@@ -1,0 +1,48 @@
+# Home Assistant automation: apply the planner's leaving-water offset to the Daikin.
+#
+# The planner writes each block of schedule.heat_pump_planner as
+#   data: {temperature: <room setpoint>, lwt_offset: <offset in K>}
+# and this automation copies lwt_offset to climate.altherma_leaving_water_offset
+# (in weather-dependent mode that entity's target temperature IS the offset).
+# Paste it in yourself next to planner_to_thermostat.yaml; the planner never installs it.
+#
+# Daikin cloud budget (about 35 spare calls a day): writes only when the planned offset differs
+# from the current one, at most once every 55 minutes, never below 15 calls left, and only within
+# the entity's own min/max. Plans typically change the offset 2-4 times a day. The hourly :07
+# trigger is a catch-up for a change skipped by the 55-minute rule.
+
+alias: Heat planner -> leaving-water offset
+description: Follow lwt_offset from schedule.heat_pump_planner (rate limited).
+mode: single
+triggers:
+  - trigger: state
+    entity_id: schedule.heat_pump_planner
+  - trigger: state
+    entity_id: schedule.heat_pump_planner
+    attribute: lwt_offset
+  - trigger: time_pattern
+    minutes: "7"
+conditions:
+  - condition: template
+    value_template: >
+      {% set want = state_attr('schedule.heat_pump_planner', 'lwt_offset') %}
+      {% set have = state_attr('climate.altherma_leaving_water_offset', 'temperature') %}
+      {% set lo = state_attr('climate.altherma_leaving_water_offset', 'min_temp') | float(-10) %}
+      {% set hi = state_attr('climate.altherma_leaving_water_offset', 'max_temp') | float(10) %}
+      {{ is_state('schedule.heat_pump_planner', 'on')
+         and want is not none and have is not none
+         and (want | float(0) - have | float(0)) | abs >= 1
+         and lo <= want | float(0) <= hi }}
+  - condition: template
+    value_template: >
+      {% set last = this.attributes.last_triggered %}
+      {{ last is none or (now() - last).total_seconds() > 3300 }}
+  - condition: template
+    value_template: >
+      {{ states('sensor.altherma_gateway_ratelimit_remaining_day') | float(99) >= 15 }}
+actions:
+  - action: climate.set_temperature
+    target:
+      entity_id: climate.altherma_leaving_water_offset
+    data:
+      temperature: "{{ state_attr('schedule.heat_pump_planner', 'lwt_offset') | int }}"

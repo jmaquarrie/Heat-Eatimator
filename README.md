@@ -3,7 +3,7 @@
 Nightly planner for a Daikin Altherma heat pump on Octopus Cosy with a home battery. Each night it
 forecasts tomorrow, simulates candidate heating schedules, and writes the cheapest comfortable one to
 the Home Assistant schedule helper `schedule.heat_pump_planner`. Background, hardware and the model
-are in [HANDOVER.md](HANDOVER.md).
+are in [HANDOVER.md](HANDOVER.md); changes since then and deployment steps are in [HANDOVER_BACK.md](HANDOVER_BACK.md).
 
 Python stdlib only. Runs on LXC 122 as `heatplanner-web` (port 8110) plus two timers.
 

@@ -1,4 +1,8 @@
-"""Read-only dashboard + JSON API for the heat pump planner (stdlib only)."""
+"""Dashboard + JSON API for the heat pump planner (stdlib only).
+
+/            new single-page dashboard (heatplanner/static/)
+/classic     the original server-rendered page
+"""
 import datetime as dt
 import html
 import json
@@ -6,10 +10,18 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import data
+from . import data, planner
+
+STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+CTYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+          ".svg": "image/svg+xml", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json"}
+# Optional shared key for actions that change things (push, re-run, occupancy). Unset = open, as before.
+WRITE_KEY = os.environ.get("HEATPLANNER_WRITE_KEY", "")
+STATUS_CACHE = {"at": 0.0, "body": None}
 
 PORT = int(os.environ.get("HEATPLANNER_PORT", "8110"))
 RUN = {"state": "idle", "started": None, "finished": None, "message": ""}
@@ -323,6 +335,136 @@ def start_rerun():
     return 200, json.dumps({"started": True}), "application/json"
 
 
+def _ha():
+    from .ha import HA
+    return HA()
+
+
+def live_status():
+    """Current readings from HA (cached 60 s). Only HA REST reads: no Daikin cloud calls are made."""
+    if STATUS_CACHE["body"] and time.time() - STATUS_CACHE["at"] < 60:
+        return STATUS_CACHE["body"]
+    cfg = data.load_config()
+    e = cfg["entities"]
+    out = {"available": False, "at": dt.datetime.now().isoformat(timespec="seconds")}
+    try:
+        ha = _ha()
+    except KeyError:
+        out["error"] = "HASS_URL / HASS_TOKEN not set for the web service"
+        return out
+
+    def get(eid):
+        try:
+            return ha.rest("/api/states/" + eid, timeout=6)
+        except Exception:
+            return None
+
+    def num(st):
+        try:
+            return float(st["state"])
+        except Exception:
+            return None
+
+    room, outdoor, soc, rate = (get(e[k]) for k in ("room", "outdoor", "battery_soc", "rate"))
+    heating, climate, helper, budget = get(e["heating"]), get(e.get("climate", "")), get(cfg["schedule_entity"]), get(e.get("api_budget", ""))
+    if room is None and outdoor is None:
+        out["error"] = "Home Assistant did not answer"
+        return out
+    out.update({"available": True, "room": num(room), "outdoor": num(outdoor), "battery_pct": num(soc), "rate": num(rate),
+                "heating": (heating or {}).get("state"), "api_budget": num(budget)})
+    if climate:
+        a = climate.get("attributes", {})
+        out["climate"] = {"state": climate.get("state"), "setpoint": a.get("temperature"), "current": a.get("current_temperature")}
+    if helper:
+        a = helper.get("attributes", {})
+        out["helper"] = {"state": helper.get("state"), "temperature": a.get("temperature"), "next_event": a.get("next_event")}
+    sp, ht = (out.get("climate") or {}).get("setpoint"), (out.get("helper") or {}).get("temperature")
+    out["following"] = None if sp is None or ht is None else abs(float(sp) - float(ht)) < 0.26
+    STATUS_CACHE.update({"at": time.time(), "body": out})
+    return out
+
+
+def actuals(date_s):
+    """Measured hourly room temperature / pump kWh for a local date, beside what that day's plan predicted."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/London")
+    d = dt.date.fromisoformat(date_s) if date_s else dt.date.today() - dt.timedelta(days=1)
+    hours = {}
+    for r in data.load_rows():
+        t = dt.datetime.fromisoformat(r["ts"]).astimezone(tz)
+        if t.date() != d:
+            continue
+        h = hours.setdefault(t.hour, {"room": [], "outdoor": [], "target": [], "kwh": 0.0})
+        for k in ("room", "outdoor", "target"):
+            if r.get(k) is not None:
+                h[k].append(r[k])
+        h["kwh"] += r.get("heat_kwh") or 0.0
+    mean = lambda v: round(sum(v) / len(v), 2) if v else None
+    act = [{"h": h, "room": mean(v["room"]), "outdoor": mean(v["outdoor"]), "target": mean(v["target"]), "kwh": round(v["kwh"], 2)}
+           for h, v in sorted(hours.items())]
+    plan = data.load_json("plan_%s.json" % d.isoformat(), None)
+    pred, strat = None, None
+    if plan and plan.get("compare"):
+        strat = plan["chosen"] if plan["chosen"] in plan["compare"] else "Optimised"
+        c = plan["compare"][strat]
+        pred = [{"h": int(t[11:13]), "room": room, "kwh": el} for t, room, el in zip(c["t"], c["room"], c["el"]) if t[:10] == d.isoformat()]
+    return {"date": d.isoformat(), "actual": act, "predicted": pred, "strategy": strat}
+
+
+def public_config():
+    cfg = data.load_config()
+    return {k: cfg[k] for k in ("schedule_entity", "tariff", "battery", "house_load_kw", "comfort", "occupancy", "fire", "blocks")}
+
+
+def recent_log(n=40):
+    try:
+        with open(data.path("log.jsonl")) as f:
+            lines = f.readlines()[-n:]
+    except FileNotFoundError:
+        return []
+    out = []
+    for l in lines:
+        try:
+            j = json.loads(l)
+            j.pop("tb", None)
+            out.append(j)
+        except ValueError:
+            pass
+    return out
+
+
+def do_simulate(body):
+    plan = data.load_json("plan_latest.json", None)
+    if not plan:
+        return 404, json.dumps({"error": "no plan yet"}), "application/json"
+    try:
+        return 200, json.dumps(planner.simulate_values(data.load_config(), plan, body.get("values"))), "application/json"
+    except ValueError as e:
+        return 400, json.dumps({"error": str(e)}), "application/json"
+
+
+def do_push(body):
+    plan = data.load_json("plan_latest.json", None)
+    if not plan:
+        return 404, json.dumps({"error": "no plan yet"}), "application/json"
+    with RUN_LOCK:
+        if RUN["state"] == "running":
+            return 409, json.dumps({"error": "the model is re-running; try again in a minute"}), "application/json"
+    try:
+        new = planner.push_values(_ha(), data.load_config(), plan, body.get("values"))
+    except ValueError as e:
+        return 400, json.dumps({"error": str(e)}), "application/json"
+    STATUS_CACHE["at"] = 0
+    try:
+        planner.publish_sensors(_ha(), data.load_config(), new)
+    except Exception:
+        pass
+    with open(data.path("log.jsonl"), "a") as f:
+        f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "event": "manual_push",
+                            "for_date": new["for_date"], "blocks": new["blocks"], "verified": new["pushed"]["verified"]}) + "\n")
+    return 200, json.dumps({"pushed": new["pushed"], "blocks": new["blocks"]}), "application/json"
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -336,11 +478,32 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def static(self, name):
+        fp = os.path.realpath(os.path.join(STATIC, name))
+        if not fp.startswith(os.path.realpath(STATIC) + os.sep) or not os.path.isfile(fp):
+            return self.send(404, "not found", "text/plain")
+        with open(fp, "rb") as f:
+            return self.send(200, f.read(), CTYPES.get(os.path.splitext(fp)[1], "application/octet-stream"))
+
     def do_GET(self):
-        p = urlparse(self.path).path
+        u = urlparse(self.path)
+        p = u.path
         try:
             if p in ("/", "/index.html"):
+                return self.static("index.html")
+            if p.startswith("/static/"):
+                return self.static(p[len("/static/"):])
+            if p == "/classic":
                 return self.send(200, page(), "text/html; charset=utf-8")
+            if p == "/api/status":
+                return self.send(200, json.dumps(live_status()), "application/json")
+            if p == "/api/actuals":
+                from urllib.parse import parse_qs
+                return self.send(200, json.dumps(actuals((parse_qs(u.query).get("date") or [None])[0])), "application/json")
+            if p == "/api/config":
+                return self.send(200, json.dumps(public_config()), "application/json")
+            if p == "/api/log":
+                return self.send(200, json.dumps(recent_log()), "application/json")
             m = {"/api/plan": "plan_latest.json", "/api/params": "params.json", "/api/plans": "plans_index.json"}
             if p in m:
                 return self.send(200, json.dumps(data.load_json(m[p], {})), "application/json")
@@ -358,6 +521,12 @@ class H(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(n) or b"{}")
+            if p == "/api/simulate":  # read-only what-if
+                return self.send(*do_simulate(body))
+            if WRITE_KEY and self.headers.get("X-Planner-Key", "") != WRITE_KEY:
+                return self.send(403, json.dumps({"error": "write key required", "need_key": True}), "application/json")
+            if p == "/api/push":
+                return self.send(*do_push(body))
             if p == "/api/occupancy":
                 return self.send(*save_occupancy(body))
             if p == "/api/rerun":

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Heat Planner</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script>try{var t=localStorage.getItem("hp-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body>
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 3c2 3.2 5 5.6 5 9.3A5 5 0 0 1 7 12.3c0-1.6.7-2.9 1.6-4 .3 1.5 1.2 2.5 2.3 2.9C10.6 8.6 11 5.6 12 3z" fill="currentColor"/></svg>
+      <span>Heat Planner</span>
+    </div>
+    <nav class="nav" aria-label="Sections">
+      <a href="#plan">Plan</a><a href="#edit">Edit</a><a href="#strategies">Compare</a><a href="#week">Week</a><a href="#home">Who's home</a><a href="#model">Model</a><a href="#history">History</a>
+    </nav>
+    <button class="icon-btn" id="theme" type="button" aria-label="Switch light or dark theme" title="Theme">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+    </button>
+  </div>
+  <div class="chips" id="chips" aria-live="polite"></div>
+</header>
+
+<main id="main">
+  <div class="loading" id="loading">Loading the latest plan…</div>
+
+  <section id="plan" class="sec" hidden>
+    <div class="hero">
+      <div class="hero-text">
+        <div class="eyebrow" id="hero-eyebrow"></div>
+        <h1 id="hero-title"></h1>
+        <p class="lede" id="hero-why"></p>
+      </div>
+      <div class="tiles" id="hero-tiles"></div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <h2>How the day plays out</h2>
+        <div class="legend" id="tl-legend"></div>
+      </div>
+      <div class="timeline" id="timeline"></div>
+      <p class="foot" id="tl-foot"></p>
+    </div>
+  </section>
+
+  <section id="edit" class="sec" hidden>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h2>Try your own setpoints</h2>
+          <p class="sub" id="edit-sub"></p>
+        </div>
+        <div class="btn-row">
+          <button type="button" class="btn ghost" id="ed-reset">Reset to plan</button>
+          <button type="button" class="btn ghost" id="ed-routine">Use my routine</button>
+        </div>
+      </div>
+      <div class="editor" id="editor"></div>
+      <div class="ed-summary" id="ed-summary"></div>
+      <div class="btn-row end">
+        <span class="msg" id="ed-msg" aria-live="polite"></span>
+        <button type="button" class="btn ghost" id="ed-rerun">Re-run optimiser</button>
+        <button type="button" class="btn primary" id="ed-push">Push to Home Assistant</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="strategies" class="sec" hidden>
+    <h2 class="sec-title">Strategies compared</h2>
+    <p class="sub">Same weather, house and tariff; only the setpoints differ. Window: <span id="st-window"></span>.</p>
+    <div class="cards" id="st-cards"></div>
+    <div class="card">
+      <div class="card-head"><h2>Where the saving comes from</h2><span class="sub" id="br-sub"></span></div>
+      <div id="breakdown"></div>
+    </div>
+  </section>
+
+  <section id="week" class="sec" hidden>
+    <h2 class="sec-title">Week ahead</h2>
+    <p class="sub">A preview of the planner for the coming days. It is re-planned every night at 22:00 as the forecast firms up.</p>
+    <div class="week" id="week-cards"></div>
+    <div class="scale" id="sp-scale"></div>
+  </section>
+
+  <section id="home" class="sec" hidden>
+    <div class="card">
+      <div class="card-head">
+        <div><h2>Who's home?</h2><p class="sub">Comfort floors only apply when someone's in. Saving re-runs the model and re-pushes the plan.</p></div>
+      </div>
+      <form id="occ" class="occ" onsubmit="return false">
+        <fieldset>
+          <legend>Usually out in the daytime on</legend>
+          <div class="toggles" id="occ-days"></div>
+          <div class="hours">
+            <label>Out from <input type="number" id="occ-from" min="0" max="24" step="0.5" inputmode="decimal"></label>
+            <label>until <input type="number" id="occ-to" min="0" max="24" step="0.5" inputmode="decimal"></label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>The next 8 days</legend>
+          <div class="days" id="occ-dates"></div>
+        </fieldset>
+        <div class="hint" id="occ-hint"></div>
+        <div class="btn-row end">
+          <span class="msg" id="occ-msg" aria-live="polite"></span>
+          <button type="button" class="btn primary" id="occ-save">Save and re-plan</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section id="model" class="sec" hidden>
+    <h2 class="sec-title">Can I trust it yet?</h2>
+    <div class="banner" id="maturity"></div>
+    <div class="tiles four" id="model-tiles"></div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-head"><h2>Predicted vs measured, day by day</h2><div class="legend" id="bt-legend"></div></div>
+        <div id="backtest"></div>
+        <p class="foot">Pump heating electricity per day. The HA counter has 1 kWh resolution, so small gaps are noise.</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2 id="act-title">Yesterday: room temperature</h2><div class="legend" id="act-legend"></div></div>
+        <div id="actuals"></div>
+        <p class="foot" id="act-foot"></p>
+      </div>
+    </div>
+    <details class="card fold">
+      <summary>Fit notes and heat-loss history</summary>
+      <div class="grid2">
+        <ul class="notes" id="model-notes"></ul>
+        <div><div class="mini-title">Heat loss (kW/K) at each daily fit</div><div id="ua-hist"></div></div>
+      </div>
+    </details>
+  </section>
+
+  <section id="history" class="sec" hidden>
+    <h2 class="sec-title">Recent plans</h2>
+    <div class="tiles" id="hist-tiles"></div>
+    <div class="card table-wrap"><table class="tbl" id="hist-table"></table></div>
+    <details class="card fold">
+      <summary>Activity log</summary>
+      <ol class="log" id="log"></ol>
+    </details>
+    <p class="foot center">Runs at 22:00 (collect, forecast, optimise, push) and re-fits at 03:30. Writes only to <code id="foot-entity"></code>. <a href="/classic">Classic view</a></p>
+  </section>
+</main>
+
+<dialog id="dlg" aria-labelledby="dlg-title">
+  <form method="dialog">
+    <h2 id="dlg-title"></h2>
+    <div id="dlg-body"></div>
+    <div class="btn-row end">
+      <button value="cancel" class="btn ghost">Cancel</button>
+      <button value="ok" class="btn primary" id="dlg-ok">Confirm</button>
+    </div>
+  </form>
+</dialog>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

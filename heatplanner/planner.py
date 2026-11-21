@@ -180,7 +180,111 @@ def build_plan(ha, cfg, params, now=None, wx=None):
                                 "status": model.day_status(cfg, today + dt.timedelta(days=i))} for i in range(0, 8)]},
     }
     plan["outlook"] = build_outlook(ha, cfg, params, wx, ctx["start_dt"], chosen_vals)
+    # everything needed to re-run the simulation later without Home Assistant (dashboard what-if editor)
+    plan["sim"] = {"start": ctx["start_dt"].isoformat(), "hours": ctx["hours"], "t_room0": ctx["t_room0"],
+                   "soc0_kwh": ctx["soc0_kwh"], "tomorrow": tomorrow.isoformat(), "terminal_ref_c": ctx["terminal_ref_c"],
+                   "fixed": [list(b) for b in fixed], "current": current, "params": params,
+                   "wx": [[t.isoformat(timespec="minutes"), v["t"], v.get("rad", 0.0)] for t, v in wx]}
     return plan
+
+
+SUMMARY_KEYS = ("total", "grid_cost", "penalty", "terminal", "kwh_hp", "kwh_by_slot", "t_min_awake", "t_end")
+
+
+def sim_context(cfg, plan):
+    """Rebuild (ctx, fixed, params, current_values) for a saved plan, so values can be re-simulated offline."""
+    s = plan.get("sim")
+    if s:
+        params = model.deep_merge(model.DEFAULT_PARAMS, s["params"])
+        wx = [(dt.datetime.fromisoformat(t), {"t": c, "rad": r}) for t, c, r in s["wx"]]
+        ctx = {"start_dt": dt.datetime.fromisoformat(s["start"]), "hours": s["hours"], "t_room0": s["t_room0"],
+               "soc0_kwh": s["soc0_kwh"], "tomorrow": dt.date.fromisoformat(s["tomorrow"]),
+               "terminal_ref_c": s.get("terminal_ref_c", 19.5),
+               "outdoor": data.series_fn(wx, "t", params.get("outdoor_bias_c", 0.0)), "radiation": data.series_fn(wx, "rad")}
+        return ctx, [tuple(b) for b in s["fixed"]], params, s.get("current") or plan["strategies"]["Current routine"]["values"]
+    # plans written before the "sim" block existed: rebuild from what was stored (no solar term)
+    params = model.deep_merge(data.load_params(), plan.get("params", {}))
+    fc = [(dt.datetime.fromisoformat(x["t"]), x["c"]) for x in plan["forecast"]]
+    start = dt.datetime.fromisoformat(plan["start"])
+    end = dt.datetime.combine(dt.date.fromisoformat(plan["for_date"]) + dt.timedelta(days=1), dt.time(4, 0))
+    ctx = {"start_dt": start, "hours": (end - start).total_seconds() / 3600, "t_room0": plan["t_room0"],
+           "soc0_kwh": plan["soc0_kwh"], "tomorrow": dt.date.fromisoformat(plan["for_date"]), "terminal_ref_c": 19.5,
+           "outdoor": data.series_fn(fc, None, params.get("outdoor_bias_c", 0.0))}
+    fixed = [(b["from"], b["to"], b["temperature"]) for b in plan.get("fixed_today_tail", [])] or [(0, 24, 18.0)]
+    return ctx, fixed, params, plan["strategies"]["Current routine"]["values"]
+
+
+def check_values(cfg, values):
+    c = cfg["comfort"]
+    if not isinstance(values, list) or len(values) != len(cfg["blocks"]):
+        raise ValueError("need %d setpoints" % len(cfg["blocks"]))
+    out = []
+    for v in values:
+        v = round(float(v) * 2) / 2
+        if not (c["min_setpoint_c"] <= v <= c["max_setpoint_c"]):
+            raise ValueError("setpoints must be %s-%s C" % (c["min_setpoint_c"], c["max_setpoint_c"]))
+        out.append(v)
+    return out
+
+
+def simulate_values(cfg, plan, values):
+    """What-if: simulate the planned day with the given block setpoints (no HA access needed)."""
+    values = check_values(cfg, values)
+    ctx, fixed, params, _ = sim_context(cfg, plan)
+    r = model.evaluate(cfg, params, ctx, fixed, values, trace=True)
+    out = {k: r[k] for k in SUMMARY_KEYS}
+    out.update({"values": values, "trace": [{k: x[k] for k in ("t", "room", "target", "el_kw", "soc", "cum")} for x in r["trace"]],
+                "blocks": [{"from": a, "to": b, "temperature": v} for a, b, v in model.tidy(values, cfg)],
+                "exact": "sim" in plan})
+    return out
+
+
+def push_values(ha, cfg, plan, values):
+    """Push a hand-edited set of setpoints for the plan's day, and record it in the plan."""
+    if dt.date.fromisoformat(plan["for_date"]) < dt.datetime.now(LOCAL).date():
+        raise ValueError("the latest plan is for %s, which has passed; re-run the model first" % plan["for_date"])
+    res = simulate_values(cfg, plan, values)
+    plan = dict(plan)
+    plan["blocks"] = res["blocks"]
+    plan["blocks_raw"] = [{"from": a, "to": b, "temperature": v} for (a, b), v in zip(cfg["blocks"], res["values"])]
+    plan["strategies"] = dict(plan["strategies"])
+    plan["strategies"]["Your edit"] = {"values": res["values"], **{k: res[k] for k in SUMMARY_KEYS}}
+    plan["chosen"] = "Your edit"
+    plan["saving_vs_current_gbp"] = round(plan["strategies"]["Current routine"]["total"] - res["total"], 3)
+    plan["manual"] = {"at": dt.datetime.now(LOCAL).isoformat(timespec="seconds"), "values": res["values"], "trace": res["trace"]}
+    plan["pushed"] = push(ha, cfg, plan)
+    save_plan(plan)
+    return plan
+
+
+def publish_sensors(ha, cfg, plan=None, error=None):
+    """Mirror the plan into HA as sensor.heatplanner_* states (dashboards/alerts in HA). Never touches schedules."""
+    if not cfg.get("publish_sensors", True):
+        return
+    if error or not plan:
+        ha.rest("/api/states/sensor.heatplanner_status", "POST", {"state": "error", "attributes": {
+            "friendly_name": "Heat planner status", "icon": "mdi:alert", "error": str(error)[:250],
+            "at": dt.datetime.now(LOCAL).isoformat(timespec="seconds")}}, timeout=10)
+        return
+    ch = plan["strategies"][plan["chosen"]]
+    ps = plan.get("pushed") or {}
+    blocks = " · ".join("%02d-%02d %.1f" % (b["from"], b["to"], b["temperature"]) for b in plan["blocks"])
+    common = {"for_date": plan["for_date"], "strategy": plan["chosen"]}
+    states = {
+        "status": ("pushed" if ps.get("verified") else ("push_unverified" if ps else "preview"),
+                   {"friendly_name": "Heat planner status", "icon": "mdi:heat-pump", "blocks": blocks,
+                    "pushed_at": ps.get("at"), "created": plan["created"], **common}),
+        "saving": (round(plan["saving_vs_current_gbp"], 2), {"friendly_name": "Heat planner saving vs routine",
+                   "unit_of_measurement": "GBP", "device_class": "monetary", "icon": "mdi:piggy-bank", **common}),
+        "cost": (round(ch["grid_cost"], 2), {"friendly_name": "Heat planner predicted grid cost", "unit_of_measurement": "GBP",
+                 "device_class": "monetary", "icon": "mdi:cash", **common}),
+        "kwh": (round(ch["kwh_hp"], 1), {"friendly_name": "Heat planner predicted pump electricity", "unit_of_measurement": "kWh",
+                "icon": "mdi:flash", **common}),
+        "min_temp": (round(ch["t_min_awake"], 1), {"friendly_name": "Heat planner lowest awake room temp",
+                     "unit_of_measurement": "°C", "device_class": "temperature", **common}),
+    }
+    for k, (st, attrs) in states.items():
+        ha.rest("/api/states/sensor.heatplanner_" + k, "POST", {"state": st, "attributes": attrs}, timeout=10)
 
 
 def build_outlook(ha, cfg, params, wx, start, chosen_vals):

@@ -39,6 +39,8 @@ DEFAULT_CONFIG = {
         "battery_soc": "sensor.marstek_m1_battery_state_of_charge",
         "heating": "binary_sensor.heat_pump_heating",
         "person": "person.arthurs_lane",
+        "climate": "climate.altherma_room_temperature",              # read-only: used to check the pump follows the plan
+        "api_budget": "sensor.altherma_gateway_ratelimit_remaining_day",
     },
     "tariff": {
         "cosy": [[4, 7], [13, 16], [22, 24]],
@@ -68,6 +70,7 @@ DEFAULT_CONFIG = {
     "optimiser": {"candidates": [x / 2 for x in range(32, 45)]},  # 16.0 .. 22.0 step 0.5
     "blocks": [[0, 4], [4, 7], [7, 13], [13, 16], [16, 19], [19, 22], [22, 24]],
     "push_hour": 22,
+    "publish_sensors": True,   # write sensor.heatplanner_* states into HA after each plan (read-only for HA, safe to disable)
 }
 
 

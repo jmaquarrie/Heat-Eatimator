@@ -58,12 +58,20 @@ def main(argv):
             if push:
                 plan["pushed"] = planner.push(ha, cfg, plan)
             planner.save_plan(plan)
+            try:
+                planner.publish_sensors(ha, cfg, plan)
+            except Exception as pe:
+                log("publish_sensors_failed", error=str(pe))
             log("plan", for_date=plan["for_date"], chosen=plan["chosen"], saving=plan["saving_vs_current_gbp"], pushed=bool(plan["pushed"]))
             print(json.dumps({k: plan[k] for k in ("for_date", "weekday", "chosen", "blocks", "forecast_tomorrow", "saving_vs_current_gbp", "pushed")}, indent=1))
             for n, r in plan["strategies"].items():
                 print("%-45s total £%.2f grid £%.2f pen £%.2f hp %.1f kWh tmin %.1f" % (n, r["total"], r["grid_cost"], r["penalty"], r["kwh_hp"], r["t_min_awake"]))
         except Exception as e:
             log("error", cmd=cmd, error=str(e), tb=traceback.format_exc())
+            try:
+                planner.publish_sensors(ha, cfg, error=e)
+            except Exception:
+                pass
             raise
     elif cmd == "seed":
         h, created = planner.ensure_helper(ha, cfg)

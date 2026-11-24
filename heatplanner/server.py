@@ -14,13 +14,16 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import data, model, planner
+from . import agent, data, model, planner, revisions
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 CTYPES = {".png": "image/png", ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
           ".svg": "image/svg+xml", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json"}
 # Optional shared key for actions that change things (push, re-run, occupancy). Unset = open, as before.
 WRITE_KEY = os.environ.get("HEATPLANNER_WRITE_KEY", "")
+# Key for the agent API (/api/agent/*). Falls back to the write key; if neither is set the API is open (LAN only).
+AGENT_KEY = os.environ.get("HEATPLANNER_AGENT_KEY", "")
+LIVE_CACHE = {}
 STATUS_CACHE = {"at": 0.0, "body": None}
 
 PORT = int(os.environ.get("HEATPLANNER_PORT", "8110"))
@@ -400,6 +403,10 @@ def actuals(date_s):
     from zoneinfo import ZoneInfo
     tz = ZoneInfo("Europe/London")
     d = dt.date.fromisoformat(date_s) if date_s else dt.date.today() - dt.timedelta(days=1)
+    if d == dt.date.today():
+        live = live_today(tz)
+        if live is not None:
+            return live
     hours = {}
     for r in data.load_rows():
         t = dt.datetime.fromisoformat(r["ts"]).astimezone(tz)
@@ -438,6 +445,45 @@ def actuals(date_s):
         pred_grid = round(plan["strategies"][plan["chosen"]]["grid_cost"], 2)
     return {"date": d.isoformat(), "actual": act, "predicted": pred, "strategy": strat, "grid": grid,
             "predicted_window_grid_cost": pred_grid}
+
+
+def live_today(tz):
+    """Today's measured room temperature and setpoint so far, straight from HA history (cached 5 min).
+    The 30-minute store is only filled at 22:00 and 03:30, so today isn't in it yet."""
+    key = dt.date.today().isoformat()
+    if LIVE_CACHE.get("key") == key and time.time() - LIVE_CACHE.get("at", 0) < 300:
+        return LIVE_CACHE["body"]
+    try:
+        ha = _ha()
+    except KeyError:
+        return None
+    cfg = data.load_config()
+    start = dt.datetime.combine(dt.date.today(), dt.time(0), tz)
+    end = dt.datetime.now(tz)
+    out = {}
+    try:
+        for k in ("room", "target"):
+            pts = [(dt.datetime.fromisoformat(t).astimezone(tz), float(v)) for t, v in
+                   ha.history(cfg["entities"][k], start.isoformat(), end.isoformat()) if _isnum(v)]
+            hours = {}
+            for t, v in pts:
+                hours.setdefault(t.hour, []).append(v)
+            out[k] = {h: round(sum(v) / len(v), 2) for h, v in hours.items()}
+    except Exception:
+        return None
+    act = [{"h": h, "room": out["room"].get(h), "target": out.get("target", {}).get(h), "kwh": 0.0, "grid_kwh": None}
+           for h in sorted(out["room"])]
+    body = {"date": key, "actual": act, "predicted": None, "strategy": None, "grid": None, "live": True}
+    LIVE_CACHE.update({"key": key, "at": time.time(), "body": body})
+    return body
+
+
+def _isnum(v):
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def public_config():
@@ -602,6 +648,15 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, json.dumps(public_config()), "application/json")
             if p == "/api/log":
                 return self.send(200, json.dumps(recent_log()), "application/json")
+            if p == "/api/revisions":
+                from urllib.parse import parse_qs
+                return self.send(200, json.dumps(revisions.for_date((parse_qs(u.query).get("date") or [dt.date.today().isoformat()])[0])), "application/json")
+            if p == "/api/chat":
+                from urllib.parse import parse_qs
+                since = int((parse_qs(u.query).get("since") or ["0"])[0] or 0)
+                return self.send(200, json.dumps({"messages": agent.chat_since(since), "agent": agent.status()}), "application/json")
+            if p.startswith("/api/agent/"):
+                return self.send(*self.agent_get(p, u))
             if p == "/api/plan":
                 plan = data.load_json("plan_latest.json", {})
                 if plan.get("outlook"):
@@ -622,6 +677,64 @@ class H(BaseHTTPRequestHandler):
             return self.send(500, "error: %s" % e, "text/plain")
 
 
+    # ---------------- agent API (Hermes) ----------------
+    def agent_ok(self):
+        k = AGENT_KEY or WRITE_KEY
+        return not k or self.headers.get("X-Agent-Key", "") == k
+
+    def agent_get(self, p, u):
+        if not self.agent_ok():
+            return 403, json.dumps({"error": "agent key required"}), "application/json"
+        from urllib.parse import parse_qs
+        q = parse_qs(u.query)
+        plan = data.load_json("plan_latest.json", None)
+        agent.touch("seen")
+        if p == "/api/agent/state":
+            if not plan:
+                return 404, json.dumps({"error": "no plan yet"}), "application/json"
+            return 200, json.dumps(agent.state(_ha_or_none(), data.load_config(), plan, live=live_status())), "application/json"
+        if p == "/api/agent/inbox":
+            since = int((q.get("since") or [agent.status_cursor()])[0] or 0)
+            msgs = agent.chat_since(since, "you")
+            if msgs and not q.get("peek"):
+                agent.mark_read(msgs[-1]["id"])
+            return 200, json.dumps({"messages": msgs, "cursor": msgs[-1]["id"] if msgs else since}), "application/json"
+        return 404, json.dumps({"error": "unknown agent endpoint"}), "application/json"
+
+    def agent_post(self, p, body):
+        if not self.agent_ok():
+            return 403, json.dumps({"error": "agent key required"}), "application/json"
+        cfg = data.load_config()
+        agent.touch("seen")
+        if p == "/api/agent/message":
+            text = str(body.get("text", "")).strip()
+            if not text:
+                return 400, json.dumps({"error": "empty message"}), "application/json"
+            kind = body.get("kind") if body.get("kind") in ("message", "update") else "message"
+            if body.get("read_upto"):
+                agent.mark_read(body["read_upto"])
+            return 200, json.dumps(agent.chat_add("hermes", text, kind=kind, meta={"title": body.get("title")} if body.get("title") else None)), "application/json"
+        plan = data.load_json("plan_latest.json", None)
+        if not plan:
+            return 404, json.dumps({"error": "no plan yet"}), "application/json"
+        try:
+            if p == "/api/agent/project":
+                return 200, json.dumps(agent.project_today(_ha_or_none(), cfg, plan, body.get("values"), body.get("offsets"))), "application/json"
+            if p == "/api/agent/suggest":
+                return 200, json.dumps(agent.suggest_today(_ha_or_none(), cfg, plan)), "application/json"
+            if p == "/api/agent/adjust":
+                with RUN_LOCK:
+                    if RUN["state"] == "running":
+                        return 409, json.dumps({"error": "the model is re-running; try again in a minute"}), "application/json"
+                res = agent.adjust(_ha(), cfg, plan, body.get("values"), body.get("offsets"), body.get("reason", ""),
+                                   post_update=body.get("post_update", True))
+                STATUS_CACHE["at"] = 0
+                _log("agent_adjust", reason=body.get("reason", "")[:200], revision=(res["revision"] or {}).get("id"))
+                return 200, json.dumps(res), "application/json"
+        except (ValueError, StopIteration, KeyError) as e:
+            return 400, json.dumps({"error": str(e) or "bad request"}), "application/json"
+        return 404, json.dumps({"error": "unknown agent endpoint"}), "application/json"
+
     def do_POST(self):
         p = urlparse(self.path).path
         try:
@@ -629,8 +742,18 @@ class H(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/simulate":  # read-only what-if
                 return self.send(*do_simulate(body))
+            if p.startswith("/api/agent/"):
+                return self.send(*self.agent_post(p, body))
             if WRITE_KEY and self.headers.get("X-Planner-Key", "") != WRITE_KEY:
                 return self.send(403, json.dumps({"error": "write key required", "need_key": True}), "application/json")
+            if p == "/api/chat":
+                text = str(body.get("text", "")).strip()
+                if not text:
+                    return self.send(400, json.dumps({"error": "empty message"}), "application/json")
+                m = agent.chat_add("you", text)
+                cfg = data.load_config()
+                agent.notify(cfg, {"type": "chat", "message": m, "state_url": "/api/agent/state", "reply_url": "/api/agent/message"})
+                return self.send(200, json.dumps(m), "application/json")
             if p == "/api/push":
                 return self.send(*do_push(body))
             if p == "/api/restore":
@@ -644,7 +767,15 @@ class H(BaseHTTPRequestHandler):
             return self.send(400, "bad request: %s" % e, "text/plain")
 
 
+def _ha_or_none():
+    try:
+        return _ha()
+    except KeyError:
+        return None
+
+
 def main():
+    threading.Thread(target=agent.checkin_loop, args=(data.load_config,), daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
 

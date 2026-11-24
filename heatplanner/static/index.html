@@ -59,6 +59,7 @@
       </div>
       <div class="timeline" id="timeline"></div>
       <p class="foot" id="tl-foot"></p>
+      <div id="changes" hidden></div>
     </div>
   </section>
 
@@ -93,7 +94,7 @@
     <div class="cards" id="st-cards"></div>
     <details class="card fold" id="score-fold">
       <summary>How the planner scores a plan</summary>
-      <p class="sub" style="margin-bottom:12px">The planner picks the lowest <b>model score</b>: electricity, plus a price on time spent below your comfort floors, plus the value of heat and battery charge left at the end. A plan can cost a little more in electricity and still win because it keeps you warm.</p>
+      <p class="sub" style="margin-bottom:12px">Every plan gets a <b>score in points, with your routine = 100</b>. The score counts electricity, time spent below your comfort floors, and the heat and battery charge left at the end of the day. Each 1% better overall than your routine adds a point, so 135 is 35% better and 90 is 10% worse. A plan can cost a little more in electricity and still score higher, because it keeps you warm.</p>
       <div class="card-head" style="margin:0"><span class="sub" id="br-sub"></span></div>
       <div id="breakdown"></div>
     </details>
@@ -182,6 +183,23 @@
   <button type="button" data-go="home"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 12h3v8h5v-5h4v5h5v-8h3z"/></svg><span>Home</span></button>
   <button type="button" data-go="more"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm7 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm7 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4z"/></svg><span>More</span></button>
 </nav>
+
+<button type="button" class="orb" id="orb" aria-label="Chat with Hermes" aria-expanded="false" aria-controls="chat">
+  <span class="orb-core" aria-hidden="true"></span><span class="orb-badge" id="orb-badge" hidden></span>
+</button>
+<section class="chat" id="chat" role="dialog" aria-label="Chat with Hermes" hidden>
+  <header class="chat-head">
+    <span class="orb-mini" aria-hidden="true"></span>
+    <div><b>Hermes</b><small id="chat-status">checking…</small></div>
+    <button type="button" class="icon-btn" id="chat-close" aria-label="Close chat">✕</button>
+  </header>
+  <ol class="chat-log" id="chat-log" aria-live="polite"></ol>
+  <form class="chat-form" id="chat-form" autocomplete="off">
+    <label for="chat-text" class="sr">Message</label>
+    <textarea id="chat-text" rows="1" placeholder="Message Hermes…"></textarea>
+    <button type="submit" class="btn primary" id="chat-send" aria-label="Send">↑</button>
+  </form>
+</section>
 
 <dialog id="dlg" aria-labelledby="dlg-title">
   <form method="dialog">

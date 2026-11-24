@@ -218,6 +218,7 @@ class Offline(unittest.TestCase):
         self.assertTrue(p["trace"])
         sg = agent.suggest_today(ha, cfg, self.plan)
         self.assertGreaterEqual(sg["score_gain_gbp"], -1e-9)          # never worse than what's in force
+        self.assertGreaterEqual(sg["score_gain_points"], 0)
         for i in sg["locked_blocks"]:                                 # ended blocks untouched
             self.assertEqual(sg["suggested"]["values"][i], sg["current"]["values"][i])
         with self.assertRaises(ValueError):                           # reason required
@@ -234,6 +235,15 @@ class Offline(unittest.TestCase):
             agent.adjust(ha, cfg, data.load_json("plan_latest.json", None), sg["current"]["values"], sg["current"]["offsets"], "and back again")
         self.assertTrue(any(r["by"] == "hermes" for r in revisions.for_date(self.plan["for_date"])))
         data.save_json("plan_latest.json", self.plan)
+
+    def test_points_score(self):
+        self.assertEqual(planner.score_points(5.0, 5.0), 100)          # routine = 100
+        self.assertEqual(planner.score_points(4.0, 5.0), 120)          # 20% better
+        self.assertEqual(planner.score_points(6.0, 5.0), 80)
+        self.assertIsNone(planner.score_points(1.0, 0.0))
+        idx = data.load_json("plans_index.json", [])
+        self.assertIn("score", idx[-1])
+        self.assertGreaterEqual(idx[-1]["score"], 100)                  # the chosen plan never scores below the routine
 
     def test_chat_channel(self):
         from heatplanner import agent

@@ -120,6 +120,7 @@ main { max-width: 1120px; margin: auto; padding: 8px 16px 48px; }
 .tag.cosy { background: var(--cosy); color: var(--cosy-ink); }
 .tag.peak { background: var(--peak); color: var(--peak-ink); }
 .tag.chosen { background: var(--plan); color: #fff; }
+.tag.score { background: color-mix(in srgb, var(--plan) 14%, var(--surface)); color: var(--ink); }
 
 /* ---------- legend + charts ---------- */
 .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--ink-2); }

@@ -196,6 +196,9 @@ def suggest_today(ha, cfg, plan, passes=3):
                           "changes": revisions.describe(cfg, {"changed": [i for i in free if vals[i] != tv[i] or (offs and offs[i] != to[i])],
                                                                "before": revisions._raw(cfg, tv, to), "after": revisions._raw(cfg, vals, offs)})},
             "electricity_saving_gbp": round(base["grid_cost"] - new["grid_cost"], 3),
+            # points vs what's in force now (= 100); higher is better
+            "score_now": 100, "score_suggested": planner.score_points(new["total"], base["total"]),
+            "score_gain_points": (planner.score_points(new["total"], base["total"]) or 100) - 100,
             "score_gain_gbp": round(base["total"] - new["total"], 3)}
 
 

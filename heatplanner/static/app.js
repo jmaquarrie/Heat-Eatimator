@@ -42,6 +42,12 @@ function tariff(h) {
   if (t.peak.some(([a, b]) => a <= x && x < b)) return { slot: "peak", rate: t.rate_peak, label: "Peak" };
   return { slot: "standard", rate: t.rate_standard, label: "Standard" };
 }
+/** Score in points: your routine = 100, each 1% cheaper overall = +1 (higher is better). */
+function scoreOf(total, routineTotal) {
+  const R = routineTotal != null ? routineTotal : (V().strategies["Current routine"] || {}).total;
+  return R > 0.1 ? Math.round(100 + (100 * (R - total)) / R) : null;
+}
+const pts = (v) => (v == null ? "–" : String(v));
 const pence = (r) => Math.round(r * 1000) / 10 + "p";
 
 /** Plain-language comfort: hours below the soft floor while home and awake. */
@@ -334,6 +340,7 @@ function renderHero() {
   const ch = p.strategies[p.chosen], cur = p.strategies["Current routine"];
   const fc = p.forecast_tomorrow;
   $("#hero-eyebrow").innerHTML = "<span>" + (p.kind === "outlook" ? "Preview · " + fmtDate(d) : when + "'s plan · " + fmtDate(d)) + "</span>" + '<span class="tag">' + deg(fc.min, 0) + " to " + deg(fc.max, 0) + " outside</span>" +
+    (p.strategies["Current routine"] && p.strategies[p.chosen] ? '<span class="tag score">Score ' + pts(scoreOf(p.strategies[p.chosen].total)) + " · routine 100</span>" : "") +
     '<span class="tag">' + ({ home: "Home all day", away_day: "Out " + rng(S.cfg.occupancy.away_from, S.cfg.occupancy.away_to), away_all: "Away all day" }[p.occupancy?.status_tomorrow] || "") + "</span>";
   let title, why = "";
   const money = cur.grid_cost - ch.grid_cost, comfort = cur.penalty - ch.penalty;
@@ -713,7 +720,7 @@ function renderEdSummary() {
     tile("Pump", r.kwh_hp.toFixed(1) + " kWh", vsPlan(r.kwh_hp, ch.kwh_hp, "kWh") || "heating only"),
     tile("Coldest awake", deg(r.t_min_awake), "floor " + deg(S.cfg.comfort.soft_floor_c)),
   ].join("");
-  $("#ed-score").textContent = "Model score " + gbp(r.total) + (e ? " (plan " + gbp(ch.total) + ", routine " + gbp(cur.total) + ")" : " (routine " + gbp(cur.total) + ")") + ". Lower is better: electricity plus a price on comfort shortfall.";
+  $("#ed-score").innerHTML = "Score <b>" + pts(scoreOf(r.total, cur.total)) + "</b>" + (e ? " (plan " + pts(scoreOf(ch.total, cur.total)) + ", your routine 100)" : " (your routine = 100)") + ". Higher is better; it counts electricity and time below your comfort floors.";
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const past = dateOf(editDate()) < today;
   $("#ed-push").disabled = !e || past;
@@ -772,7 +779,7 @@ function renderStrategies() {
       '<div class="comfort ' + (ok ? "ok" : "low") + '"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' + (ok ? '<path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>' : '<path d="M8 3v6M8 12v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>') + "</svg>" + comfortText(r) + "</div>" +
       (cmp[n] ? sparkline(cmp[n].room, COLOR[n], lo, hi) : "") +
       strip(tidy(r.values), false) +
-      '<div class="kv"><span>Pump</span><b>' + r.kwh_hp.toFixed(1) + " kWh</b>" + (offOn() && r.offsets ? "<span>Water offset</span><b>" + offSummary(r.offsets) + "</b>" : "") + "<span>Coldest awake</span><b>" + deg(r.t_min_awake) + "</b><span>Model score</span><b>" + gbp(r.total) + "</b></div>" +
+      '<div class="kv"><span>Pump</span><b>' + r.kwh_hp.toFixed(1) + " kWh</b>" + (offOn() && r.offsets ? "<span>Water offset</span><b>" + offSummary(r.offsets) + "</b>" : "") + "<span>Coldest awake</span><b>" + deg(r.t_min_awake) + "</b><span>Score</span><b>" + pts(scoreOf(r.total, cur.total)) + " pts</b></div>" +
       '<p class="why">' + (ex.length ? esc(ex.slice(0, 4).join("; ")) : "Same setpoints as your routine.") + "</p>" +
       '<button type="button" class="btn ghost" data-try="' + esc(n) + '">Open in editor</button></article>';
   }).join("");
@@ -791,8 +798,10 @@ function renderBreakdown() {
   const comps = [["cosy", "Cosy-rate electricity"], ["standard", "Standard-rate electricity"], ["peak", "Peak-rate electricity"], ["penalty", "Comfort shortfall"], ["terminal", "Heat left in the house"], ["battery", "Battery left over"]];
   const a = cmp["Current routine"].breakdown, b = cmp[chName].breakdown;
   const rows = comps.map(([k, l]) => ({ l, v: a[k] - b[k] }));
+  const R = p.strategies["Current routine"].total;
+  rows.forEach((r) => (r.v = R > 0.1 ? (100 * r.v) / R : 0));      // £ → points (routine = 100)
   const net = rows.reduce((s, r) => s + r.v, 0);
-  $("#br-sub").textContent = "Score difference by part: " + NAMES[chName] + " vs your routine";
+  $("#br-sub").textContent = "Points by part: " + NAMES[chName] + " (" + pts(scoreOf(p.strategies[chName].total)) + ") vs your routine (100)";
   const W = Math.max(280, box.clientWidth || 600), narrow = W < 560;
   const LW = narrow ? 140 : 200, VW = 60, rowH = 30;
   const m = Math.max(0.05, ...rows.map((r) => Math.abs(r.v)));
@@ -803,12 +812,12 @@ function renderBreakdown() {
   rows.forEach((r, i) => {
     const y = 22 + i * rowH, w = Math.abs(r.v) * sc;
     o.push('<text x="0" y="' + (y + 15) + '" style="fill:var(--ink-2);font-size:' + (narrow ? 12 : 13) + 'px">' + r.l + "</text>");
-    if (w > 0.5) o.push('<rect x="' + (r.v >= 0 ? cx : cx - w) + '" y="' + (y + 4) + '" width="' + w + '" height="16" rx="3" fill="' + (r.v >= 0 ? "var(--plan)" : "var(--crit)") + '"><title>' + r.l + ": " + gbp(Math.abs(r.v)) + (r.v >= 0 ? " better" : " worse") + "</title></rect>");
-    o.push('<text x="' + W + '" y="' + (y + 16) + '" text-anchor="end" style="fill:var(--ink);font-size:13px;font-variant-numeric:tabular-nums">' + (r.v >= 0 ? "+" : "−") + "£" + Math.abs(r.v).toFixed(2) + "</text>");
+    if (w > 0.5) o.push('<rect x="' + (r.v >= 0 ? cx : cx - w) + '" y="' + (y + 4) + '" width="' + w + '" height="16" rx="3" fill="' + (r.v >= 0 ? "var(--plan)" : "var(--crit)") + '"><title>' + r.l + ": " + Math.abs(r.v).toFixed(1) + " points " + (r.v >= 0 ? "better" : "worse") + "</title></rect>");
+    o.push('<text x="' + W + '" y="' + (y + 16) + '" text-anchor="end" style="fill:var(--ink);font-size:13px;font-variant-numeric:tabular-nums">' + (r.v >= 0 ? "+" : "−") + Math.abs(r.v).toFixed(1) + " pts</text>");
   });
   o.push('<line class="base" x1="' + cx + '" x2="' + cx + '" y1="18" y2="' + (H - 6) + '"/></svg>');
   const nb = p.strategies["Optimised (no battery, for reference)"];
-  box.innerHTML = o.join("") + '<p class="foot">Net score difference ' + gbp(net) + "." + (nb ? " Without the battery the optimised plan would need " + gbp(nb.grid_cost) + " of electricity." : "") + "</p>";
+  box.innerHTML = o.join("") + '<p class="foot">Net ' + (net >= 0 ? "+" : "−") + Math.abs(net).toFixed(0) + " points." + (nb ? " Without the battery the optimised plan would need " + gbp(nb.grid_cost) + " of electricity." : "") + "</p>";
 }
 
 /* ---------------------------------------------------------------- week */
@@ -977,14 +986,18 @@ function renderMeter() {
 /* ---------------------------------------------------------------- history */
 function renderHistory() {
   const idx = S.idx.slice().reverse();
-  const tot = idx.reduce((s, i) => s + (i.saving_gbp || 0), 0);
+  const scored = idx.filter((i) => i.score != null);
+  const avg = scored.length ? Math.round(scored.reduce((s, i) => s + i.score, 0) / scored.length) : null;
+  const withE = idx.filter((i) => i.electricity_vs_routine_gbp != null);
+  const elec = withE.reduce((s, i) => s + i.electricity_vs_routine_gbp, 0);
   const first = idx.length ? dateOf(idx[idx.length - 1].for_date) : null;
   $("#hist-tiles").innerHTML = [
-    tile("Model score gained", gbp(tot), idx.length + " plans since " + (first ? fmtDate(first) : "–")),
-    tile("Average per day", idx.length ? gbp(tot / idx.length) : "–", "Model estimate incl. comfort, not metered"),
+    tile("Average score", avg != null ? avg + " pts" : "–", scored.length ? "over " + scored.length + " plans · your routine = 100" : "scores appear from the next plan"),
+    tile("Electricity vs your routine", withE.length ? (Math.abs(elec) < 0.005 ? "same" : gbp(Math.abs(elec)) + (elec > 0 ? " less" : " more")) : "–",
+         withE.length ? withE.length + " plans since " + (first ? fmtDate(first) : "–") + " · model estimate" : "appears from the next plan"),
   ].join("");
-  $("#hist-table").innerHTML = "<thead><tr><th>Day</th><th>Plan</th><th>Setpoints</th><th class='r'>Score gain</th><th>Pushed</th></tr></thead><tbody>" +
-    idx.slice(0, 14).map((i) => "<tr><td>" + fmtDate(dateOf(i.for_date)) + "</td><td>" + esc(NAMES[i.chosen] || i.chosen) + "</td><td>" + strip(i.blocks || [], false) + "</td><td class='r'>" + gbp(i.saving_gbp || 0) + "</td><td>" + (i.pushed ? (i.pushed.verified ? "✓ verified" : "unverified") : "preview") + "</td></tr>").join("") + "</tbody>";
+  $("#hist-table").innerHTML = "<thead><tr><th>Day</th><th>Plan</th><th>Setpoints</th><th class='r'>Score</th><th>Pushed</th></tr></thead><tbody>" +
+    idx.slice(0, 14).map((i) => "<tr><td>" + fmtDate(dateOf(i.for_date)) + "</td><td>" + esc(NAMES[i.chosen] || i.chosen) + "</td><td>" + strip(i.blocks || [], false) + "</td><td class='r'>" + (i.score != null ? i.score + " pts" : "–") + "</td><td>" + (i.pushed ? (i.pushed.verified ? "✓ verified" : "unverified") : "preview") + "</td></tr>").join("") + "</tbody>";
   $("#log").innerHTML = S.log.slice().reverse().map((l) => {
     const rest = Object.entries(l).filter(([k]) => k !== "at" && k !== "event").map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join(" ");
     return '<li class="' + (l.event === "error" ? "e-error" : "") + '">' + esc((l.at || "").replace("T", " ")) + " <b>" + esc(l.event) + "</b> " + esc(rest.slice(0, 200)) + "</li>";

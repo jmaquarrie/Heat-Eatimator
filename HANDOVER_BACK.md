@@ -187,6 +187,11 @@ old code).
     caught and the offset raised.
   - A full plan build is now about 30 s on a fast machine (was about 14 s); expect about a minute on the LXC,
     well inside the 600 s unit timeout.
+- **Score in points** (owner's request, the £ "model score" was confusing): routine = 100,
+  `planner.score_points(total, routine_total)`. Shown on the dashboard, stored per plan in
+  `plans_index.json` (`score`, `electricity_vs_routine_gbp`), published as `sensor.heatplanner_score`.
+  `sensor.heatplanner_saving` is now the electricity saving in £. Hermes's suggest returns
+  `score_gain_points` (what's in force = 100).
 - After a manual or Hermes change, the plan's prediction (`trace_best`) is recomputed, so the chart shows
   the plan in force. `original_blocks_raw` keeps the 22:00 version.
 

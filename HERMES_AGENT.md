@@ -6,7 +6,7 @@ update explaining each change. The owner can also chat with Hermes from the dash
 bottom-right corner that opens a chat panel.
 
 The planner does the maths and Hermes does the judgement. Hermes asks the planner for a projection or a
-re-optimised suggestion, decides whether it makes sense (weather, who's home, what the owner said in chat),
+re-optimised suggestion (scored in points, where what's in force now = 100), decides whether it makes sense (weather, who's home, what the owner said in chat),
 and applies it through one guarded endpoint. Every change is recorded with its reason, drawn on the dashboard
 chart as an **H** marker, and posted to the chat as a "Change made" card.
 
@@ -69,7 +69,7 @@ message.
    for something ("warm the snug for 7pm", "we're out until 6"), work out the values and go to step 5.
 3. Compare `room_now` with `predicted_now`. As a rule of thumb, act only if they differ by **more than
    0.7 °C**, if the occupancy is different from planned, or if the owner asked.
-4. `POST /api/agent/suggest`. Consider applying it if `score_gain_gbp` is at least 0.05, or comfort improves
+4. `POST /api/agent/suggest`. Consider applying it if `score_gain_points` is at least 2 (score in points, where what's in force now = 100), or comfort improves
    (`hours_below` drops), and it agrees with what you know. Otherwise do nothing; that's the normal case.
    - **Water offset:** the model may keep the offset at the low end of the range. If the house is lagging
      the prediction (cooler than predicted and the setpoint not being reached), raising the offset by 1–2
@@ -103,7 +103,7 @@ message.
 H='X-Agent-Key: '"$HEATPLANNER_AGENT_KEY"
 B=http://192.168.1.152:8110
 curl -s -H "$H" $B/api/agent/state | jq '.today | {room_now, predicted_now, summary}'
-curl -s -H "$H" -X POST $B/api/agent/suggest -d '{}' | jq '{score_gain_gbp, changes: .suggested.changes}'
+curl -s -H "$H" -X POST $B/api/agent/suggest -d '{}' | jq '{score_gain_points, changes: .suggested.changes}'
 curl -s -H "$H" -X POST $B/api/agent/adjust \
   -d '{"values":[18,20,19.5,21,20,20,17.5],"offsets":[-5,-5,-5,-3,-2,-2,0],"reason":"Room is lagging the plan by 0.9°; raising the water for the evening."}'
 curl -s -H "$H" -X POST $B/api/agent/message -d '{"text":"Done, the snug should be at 20° by 7pm.","read_upto":12}'

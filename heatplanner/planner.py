@@ -39,6 +39,14 @@ def helper_to_values(cfg, blocks, default, key="temperature"):
     return vals
 
 
+def score_points(total, routine_total):
+    """Plan score in points: your routine = 100; each 1% cheaper (model total: electricity + priced comfort
+    shortfall + end-of-day heat) is +1. Higher is better. None if the routine total is too small to compare."""
+    if routine_total is None or routine_total <= 0.1:
+        return None
+    return round(100 + 100 * (routine_total - total) / routine_total)
+
+
 def offsets_on(cfg):
     return bool(cfg.get("lwt_offset", {}).get("enabled"))
 
@@ -469,8 +477,11 @@ def publish_sensors(ha, cfg, plan=None, error=None):
         "status": ("pushed" if ps.get("verified") else ("push_unverified" if ps else "preview"),
                    {"friendly_name": "Heat planner status", "icon": "mdi:heat-pump", "blocks": blocks,
                     "pushed_at": ps.get("at"), "created": plan["created"], **common}),
-        "saving": (round(plan["saving_vs_current_gbp"], 2), {"friendly_name": "Heat planner saving vs routine",
-                   "unit_of_measurement": "GBP", "device_class": "monetary", "icon": "mdi:piggy-bank", **common}),
+        "saving": (round(plan["strategies"]["Current routine"]["grid_cost"] - ch["grid_cost"], 2),
+                   {"friendly_name": "Heat planner electricity saving vs routine", "unit_of_measurement": "GBP",
+                    "device_class": "monetary", "icon": "mdi:piggy-bank", **common}),
+        "score": (score_points(ch["total"], plan["strategies"]["Current routine"]["total"]),
+                  {"friendly_name": "Heat planner score (routine = 100)", "unit_of_measurement": "pts", "icon": "mdi:scoreboard", **common}),
         "cost": (round(ch["grid_cost"], 2), {"friendly_name": "Heat planner predicted grid cost", "unit_of_measurement": "GBP",
                  "device_class": "monetary", "icon": "mdi:cash", **common}),
         "kwh": (round(ch["kwh_hp"], 1), {"friendly_name": "Heat planner predicted pump electricity", "unit_of_measurement": "kWh",
@@ -768,7 +779,10 @@ def save_plan(plan):
     data.save_json("plan_%s.json" % plan["for_date"], {k: v for k, v in plan.items() if k not in ("trace_best", "trace_current", "forecast")})
     idx = data.load_json("plans_index.json", [])
     idx = [i for i in idx if i["for_date"] != plan["for_date"]]
+    st = plan.get("strategies") or {}
     idx.append({"for_date": plan["for_date"], "created": plan["created"], "chosen": plan["chosen"],
-                "saving_gbp": plan["saving_vs_current_gbp"], "blocks": plan["blocks"], "pushed": plan["pushed"],
+                "saving_gbp": plan["saving_vs_current_gbp"],
+                "score": score_points(st.get(plan["chosen"], {}).get("total", 0), st.get("Current routine", {}).get("total")),
+                "electricity_vs_routine_gbp": round(st.get("Current routine", {}).get("grid_cost", 0) - st.get(plan["chosen"], {}).get("grid_cost", 0), 2) if st else None, "blocks": plan["blocks"], "pushed": plan["pushed"],
                 "forecast": plan["forecast_tomorrow"]})
     data.save_json("plans_index.json", idx[-120:])

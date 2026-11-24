@@ -54,11 +54,13 @@ Add its entities to `/opt/heatplanner/data/config.json`:
 into Cosy, Standard and Peak, with its cost at your rates. `grid_power` (W, positive = importing)
 appears as a live chip.
 
-### "Model score" vs money
-A strategy's total is grid cost plus priced comfort shortfall plus end-of-window heat and battery
-value. A plan can therefore "win" while costing more in electricity, because it stops the room
-dropping below the comfort floor. The dashboard shows both: the headline names real pounds, and
-the cards show electricity against routine separately.
+### Score (points) vs money
+Every plan gets a **score in points, with your routine = 100**:
+`100 + 100 × (routine total − plan total) ÷ routine total`, where the total is electricity plus a price on
+time below your comfort floors plus the end-of-day heat and battery value. Higher is better: 135 is 35%
+better than your routine, 90 is 10% worse. Points add up per component, so "How the planner scores a plan"
+shows where they come from. Real electricity is still shown in pounds. HA gets `sensor.heatplanner_score`
+(points), and `sensor.heatplanner_saving` is now the electricity difference against your routine in £.
 
 ## Leaving water offset
 

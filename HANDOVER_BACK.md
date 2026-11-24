@@ -167,6 +167,29 @@ diff /tmp/base_planner.py /tmp/live_planner.py && echo "live code matches the ba
 chown, then restart `heatplanner-web`. `data/` is forward and backward compatible (new keys are ignored by the
 old code).
 
+## Update 24 Nov: Hermes supervision, intraday changes, offset search
+- **Read [HERMES_AGENT.md](HERMES_AGENT.md).** It's the contract for Hermes: endpoints, guard rails, the
+  suggested check-in routine, and how chat messages reach Hermes (polling or webhook).
+- New env var (optional but recommended): `HEATPLANNER_AGENT_KEY` in `/etc/heatplanner.env`. Hermes sends it
+  as `X-Agent-Key`. Restarting `heatplanner-web` is needed for it to take effect (ask the owner first).
+- New data files: `chat.json`, `revisions.json`, `agent_state.json`. All are safe to delete.
+- New optional config block: `"agent": {"max_adjustments_per_day": 8, "min_minutes_between": 20,
+  "max_setpoint_change_c": 2.0, "webhook_url": "", "checkin_times": []}`.
+- Dashboard: every view opens on **today**. Intraday changes are drawn on the chart (original setpoint,
+  H/Y markers with reasons, measured room today from HA history) and listed under it. A chat orb sits
+  bottom-right.
+- **Offset fix:** the optimiser used to start from the offset currently on the Daikin, and a single-block
+  change cost two priced writes, so offsets "stuck" wherever they barely mattered. It now also starts from
+  several uniform offsets and tries moving a whole run of blocks at once. In tests the result no longer
+  depends on the starting offset.
+  - In mild weather it may sit at the bottom of the range (−5), because with radiator output 1.0 kW/K the
+    radiators keep up and cooler water is always cheaper. Hermes's check-ins are where a lagging house gets
+    caught and the offset raised.
+  - A full plan build is now about 30 s on a fast machine (was about 14 s); expect about a minute on the LXC,
+    well inside the 600 s unit timeout.
+- After a manual or Hermes change, the plan's prediction (`trace_best`) is recomputed, so the chart shows
+  the plan in force. `original_blocks_raw` keeps the 22:00 version.
+
 ## 4. What the owner still has to do in HA
 1. Review and paste `deploy/ha/planner_to_thermostat.yaml` (setpoint → `climate.altherma_room_temperature`).
 2. Review and paste `deploy/ha/planner_offset_to_daikin.yaml` (lwt_offset → `climate.altherma_leaving_water_offset`).

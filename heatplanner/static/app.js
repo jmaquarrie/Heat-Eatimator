@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editOff: null, editRes: null, actuals: null, occ: null, sel: null, view: null };
+const S = { plan: null, params: null, idx: [], cfg: null, status: null, log: [], edit: null, editOff: null, editRes: null, actuals: null, occ: null, sel: null, view: null, revs: [], measured: null, chat: [], chatSeen: 0, agent: {} };
 const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const WDL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -83,7 +83,7 @@ async function loadAll() {
   const [plan, params, idx, cfg, log] = await Promise.all(["/api/plan", "/api/params", "/api/plans", "/api/config", "/api/log"].map((p) => api(p).catch(() => null)));
   S.plan = plan && plan.for_date ? plan : null; S.params = params || {}; S.idx = idx || []; S.cfg = cfg; S.log = log || [];
   S.edit = null; S.editOff = null; S.editRes = null; S.occ = null;
-  if (S.plan) await selectDay(dayOptions().includes(S.sel) || S.sel === isoDate(new Date()) ? S.sel : defaultDay(), false);
+  if (S.plan) await selectDay(dayOptions().includes(S.sel) ? S.sel : defaultDay(), false);
   const off = $("#offline");
   off.hidden = !servedFromCache;
   if (servedFromCache) off.textContent = "Offline: showing the plan saved on this device. Live readings and editing come back when the planner is reachable.";
@@ -103,13 +103,15 @@ function planValues() { return V().blocks_raw.map((b) => b.temperature); }
 function offOn() { const v = V(); return !!(v && v.lwt_offset && v.lwt_offset.enabled && v.blocks_raw[0] && "lwt_offset" in v.blocks_raw[0]); }
 function planOffsets() { return offOn() ? V().blocks_raw.map((b) => b.lwt_offset) : null; }
 /** Days you can pick without the "Edit today's plan" button: future days only. */
+function todayAvailable() { const p = S.plan, t = isoDate(new Date()); return p.for_date === t || !!(p.sim && p.sim.start.slice(0, 10) === t && p.sim.fixed); }
 function dayOptions() {
   const t = isoDate(new Date()), out = [];
+  if (todayAvailable()) out.push(t);
   if (S.plan.for_date > t) out.push(S.plan.for_date);
   (S.plan.outlook || []).forEach((o) => { if (!o.error && o.date > t && !out.includes(o.date)) out.push(o.date); });
   return out;
 }
-function defaultDay() { const o = dayOptions(); return o.length ? o[0] : S.plan.for_date; }
+function defaultDay() { const o = dayOptions(); return o.length ? o[0] : S.plan.for_date; }   // today when it can be shown
 async function selectDay(iso, redraw = true) {
   S.sel = iso; S.edit = null; S.editOff = null; S.editRes = null;
   if (iso === S.plan.for_date) S.view = null;
@@ -117,17 +119,22 @@ async function selectDay(iso, redraw = true) {
     try { const v = await api("/api/day?date=" + iso); S.view = v.kind === "plan" ? null : v; }
     catch (e) { S.view = null; S.sel = S.plan.for_date; }
   }
-  if (redraw) { renderDayPick(); renderHero(); renderEditor(); renderTimeline(); }
+  await loadDayExtras();
+  if (redraw) { renderDayPick(); renderHero(); renderEditor(); renderTimeline(); renderChanges(); }
+}
+/** Revisions for the selected day, and (for today) what the room has actually done so far. */
+async function loadDayExtras() {
+  S.revs = await api("/api/revisions?date=" + S.sel).catch(() => []);
+  S.measured = S.sel === isoDate(new Date()) ? await api("/api/actuals?date=" + S.sel).catch(() => null) : null;
 }
 function renderDayPick() {
   const t = isoDate(new Date()), opts = dayOptions().slice();
-  if (S.sel === t) opts.unshift(t);
   const wk = {}; (S.plan.outlook || []).forEach((o) => (wk[o.date] = o));
   const html = opts.map((iso) => {
     const d = dateOf(iso), lab = iso === t ? "Today" : WD[wdIdx(d)] + " " + d.getDate();
-    const tag = iso === t ? "" : iso === S.plan.for_date ? "planned" : wk[iso] && wk[iso].edited ? "your edit" : "preview";
+    const tag = iso === t ? "now" : iso === S.plan.for_date ? "planned" : wk[iso] && wk[iso].edited ? "your edit" : "preview";
     return '<button type="button" class="dp' + (iso === S.sel ? " on" : "") + '" data-day="' + iso + '" aria-pressed="' + (iso === S.sel) + '"><b>' + lab + "</b>" + (tag ? "<small>" + tag + "</small>" : "") + "</button>";
-  }).join("") + (S.sel === t ? '<button type="button" class="dp close" data-day="' + defaultDay() + '" aria-label="Back to the next day">✕</button>' : "");
+  }).join("");
   document.querySelectorAll(".daypick").forEach((el) => {
     el.innerHTML = html;
     el.querySelectorAll("[data-day]").forEach((b) => b.addEventListener("click", () => selectDay(b.dataset.day).then(renderWeek)));
@@ -155,7 +162,7 @@ function lockedIdx() {
   return new Set(S.cfg.blocks.map(([a, b], i) => (b <= h ? i : -1)).filter((i) => i >= 0));
 }
 function editing() { return !!(S.editRes && ((S.edit && !sameVals(S.edit, baseVals())) || (S.editOff && offOn() && !sameVals(S.editOff, baseOffs())))); }
-function chosenLabel() { return NAMES[V().chosen] || V().chosen; }
+function chosenLabel() { const v = V(); return v.chosen === "Your edit" && v.manual && v.manual.by === "hermes" ? "Hermes-adjusted" : NAMES[v.chosen] || v.chosen; }
 function isDark() { const t = document.documentElement.dataset.theme; return t ? t === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; }
 
 function seqColor(v) {
@@ -236,7 +243,7 @@ function render() {
   if (!S.plan) { $("#loading").textContent = "No plan yet. The first one is made at 22:00, or run “heatplanner.cli plan”."; return; }
   document.querySelectorAll(".sec").forEach((s) => (s.hidden = false));
   setTab(document.body.dataset.tab, false);
-  renderDayPick(); renderNow(); renderHero(); renderEditor(); renderStrategies(); renderWeek(); renderOcc(); renderModel(); renderHistory(); renderChips();
+  renderDayPick(); renderNow(); renderHero(); renderEditor(); renderChanges(); renderStrategies(); renderWeek(); renderOcc(); renderModel(); renderHistory(); renderChips();
   drawCharts();
   $("#foot-entity").textContent = S.cfg.schedule_entity;
 }
@@ -309,10 +316,13 @@ function renderNow() {
     '<div class="now-next"><span class="k">Next change</span>' + (nextB ? '<span class="nx"><b>' + nextWhen + "</b> → <b>" + deg(nextB.temperature) + '</b></span><span class="tag ' + tariff(nextB.from).slot + '">' + tariff(nextB.from).label + "</span>" : '<span class="nx">None today</span>') + "</div></div>" +
     strip24 + '<div class="facts">' + facts.join("") + "</div>" +
     (st.available === false ? '<p class="foot">Live readings unavailable: ' + esc(st.error || "") + "</p>" : "") +
-    '<div class="now-actions"><button type="button" class="btn ghost" id="edit-today">Edit today\'s plan</button></div>';
-  const et = $("#edit-today");
-  et.hidden = !(p.for_date === todayIso() || (p.sim && p.sim.start.slice(0, 10) === todayIso()));
-  et.onclick = async () => { await selectDay(todayIso()); renderWeek(); if (MOBILE()) { history.replaceState(null, "", "#plan"); setTab("plan"); } else $("#plan").scrollIntoView(); };
+    latestUpdateHtml();
+}
+
+function latestUpdateHtml() {
+  const u = (S.chat || []).filter((m) => m.from === "hermes" && m.kind === "update").slice(-1)[0];
+  if (!u) return "";
+  return '<button type="button" class="hermes-latest" onclick="openChat()"><span class="orb-mini" aria-hidden="true"></span><span><b>Hermes, ' + esc(u.at.slice(11, 16)) + ":</b> " + esc(u.text.split("\n")[0].slice(0, 160)) + "</span></button>";
 }
 
 /* ---------------------------------------------------------------- hero */
@@ -329,6 +339,7 @@ function renderHero() {
   const money = cur.grid_cost - ch.grid_cost, comfort = cur.penalty - ch.penalty;
   if (p.kind === "today_tail") { title = "The rest of today"; why = "Tonight's remaining setpoints. Tomorrow's plan is shown on its own day."; }
   else if (p.chosen === "Current routine") { title = "Your routine is already the best plan"; why = "Nothing beat it by more than 2p, so the planner kept your usual setpoints."; }
+  else if (p.chosen === "Your edit" && p.manual && p.manual.by === "hermes") { title = "Hermes adjusted today's plan"; why = esc(p.manual.reason || "") + " "; }
   else if (p.chosen === "Your edit") { title = "Running your edited plan"; why = "Pushed by hand at " + esc((p.manual?.at || "").slice(11, 16)) + ". " + (money >= 0.01 ? "About " + gbp(money) + " less electricity than your routine. " : money <= -0.01 ? "About " + gbp(-money) + " more electricity than your routine. " : "") + "Tonight's 22:00 run plans the next day as normal."; }
   else {
     if (money >= 0.01) title = "Saves about " + gbp(money) + " on electricity" + (comfort > 0.05 ? " and keeps you warmer" : "");
@@ -421,8 +432,42 @@ function renderTimeline() {
   o.push('<path d="' + stepPath(rows.map((r) => r.target), Yr) + '" fill="none" stroke="var(--ink-2)" stroke-width="1.5" stroke-dasharray="5 4"/>');
   if (ed) o.push('<path d="' + stepPath(ed.map((r) => r.target), Yr) + '" fill="none" stroke="var(--edit)" stroke-width="1.5" stroke-dasharray="5 4" opacity=".8"/>');
   if (rout) o.push('<path d="' + path(rout, x, Yr) + '" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="2 3"/>');
+  // the setpoints as originally planned, when the day has been changed since
+  const revs = (S.revs || []).filter((r) => r.kind !== "undo" || true);
+  let orig = null;
+  if (revs.length) {
+    orig = revs[0].before.map((b) => b.temperature);
+    const segs = [];
+    rows.forEach((r, j) => {
+      if (r.t.slice(0, 10) !== p.for_date) return;
+      const tt = parseT(r.t), hr = tt.getHours() + tt.getMinutes() / 60, bi = S.cfg.blocks.findIndex(([a, b]) => hr >= a && hr < b);
+      if (bi >= 0) segs.push("M" + x(j).toFixed(1) + "," + Yr(orig[bi]).toFixed(1) + "H" + x(j + 1).toFixed(1));
+    });
+    if (segs.length) o.push('<path d="' + segs.join("") + '" fill="none" stroke="var(--s4)" stroke-width="2" stroke-dasharray="1 3" stroke-linecap="round"/>');
+  }
   o.push('<path d="' + path(plan, x, Yr) + '" fill="none" stroke="var(--plan)" stroke-width="2.25" stroke-linejoin="round"/>');
   if (edt) o.push('<path d="' + path(edt, x, Yr) + '" fill="none" stroke="var(--edit)" stroke-width="2.25" stroke-linejoin="round"/>');
+  // what the room actually did today (hourly means from HA history)
+  const meas = S.measured && S.measured.actual ? S.measured.actual.filter((r) => r.room != null) : [];
+  const day0 = dateOf(p.for_date);
+  const xAt = (dtm) => x((dtm - t0) / 9e5);
+  if (meas.length && S.sel === isoDate(new Date())) {
+    const pts = meas.map((r) => [xAt(new Date(day0.getFullYear(), day0.getMonth(), day0.getDate(), r.h, 30)), Yr(r.room), r]).filter(([xx]) => xx >= L && xx <= W - R);
+    if (pts.length) {
+      o.push('<path d="' + pts.map(([xx, yy], i) => (i ? "L" : "M") + xx.toFixed(1) + "," + yy.toFixed(1)).join("") + '" fill="none" stroke="var(--measured)" stroke-width="2"/>');
+      pts.forEach(([xx, yy, r]) => o.push('<circle cx="' + xx.toFixed(1) + '" cy="' + yy.toFixed(1) + '" r="3.5" fill="var(--measured)" stroke="var(--surface)" stroke-width="1.5"><title>' + hh(r.h) + "–" + hh(r.h + 1) + " measured " + r.room + "°</title></circle>"));
+    }
+  }
+  // a marker at each change made to this day
+  revs.forEach((r) => {
+    const at = new Date(r.at.slice(0, 19));
+    const xx = xAt(at);
+    if (xx < L || xx > W - R) return;
+    const col = r.by === "hermes" ? "var(--s3)" : r.by === "you" ? "var(--edit)" : "var(--ink-2)";
+    o.push('<g class="rev-mark"><line x1="' + xx + '" x2="' + xx + '" y1="' + RL.y0 + '" y2="' + (RL.y0 + RL.h) + '" stroke="' + col + '" stroke-width="1.5" stroke-dasharray="3 2"/>' +
+      '<circle cx="' + xx + '" cy="' + (RL.y0 + 8) + '" r="8" fill="' + col + '"/><text x="' + xx + '" y="' + (RL.y0 + 12) + '" text-anchor="middle" style="fill:#fff;font-size:10px;font-weight:700">' + (r.by === "hermes" ? "H" : r.by === "you" ? "Y" : "P") + "</text>" +
+      "<title>" + esc((r.by === "hermes" ? "Hermes" : r.by === "you" ? "You" : "Planner") + " at " + r.at.slice(11, 16) + ": " + (r.reason || "edit") + " — " + describeRev(r).join("; ")) + "</title></g>");
+  });
   const dls = [{ t: "Plan", v: plan[n], col: "var(--plan)" }];
   if (rout && p.chosen !== "Current routine") dls.push({ t: "Routine", v: rout[n], col: "var(--muted)" });
   if (edt) dls.push({ t: "Edit", v: edt[n], col: "var(--edit)" });
@@ -512,6 +557,9 @@ function renderTimeline() {
   if (rout && p.chosen !== "Current routine") lg.push('<span><i class="sw dot" style="border-color:var(--muted)"></i>Your routine</span>');
   if (edt) lg.push('<span><i class="sw" style="border-color:var(--edit)"></i>Your edit</span>');
   if (rows[0].lwt != null) lg.push('<span><i class="sw dash" style="border-color:var(--muted)"></i>Water at offset 0</span>');
+  if (orig) lg.push('<span><i class="sw dot" style="border-color:var(--s4)"></i>Setpoint as first planned</span>');
+  if (meas.length && S.sel === isoDate(new Date())) lg.push('<span><i class="sw" style="border-color:var(--measured)"></i>Measured today</span>');
+  if (revs.length) lg.push('<span><i class="sw box" style="background:var(--s3)"></i>H = Hermes, Y = you</span>');
   lg.push('<span><i class="sw dash" style="border-color:var(--ink-2)"></i>Setpoint</span>', '<span><i class="sw box" style="background:var(--below)"></i>Below comfort floor</span>', '<span><i class="sw box" style="background:var(--cosy)"></i>Cosy</span>', '<span><i class="sw box" style="background:var(--peak)"></i>Peak</span>');
   $("#tl-legend").innerHTML = lg.join("");
   $("#tl-foot").innerHTML = "<b>Drag a handle</b> up or down to try a different setpoint for that block. It's simulated straight away; nothing is pushed until you choose to. Window " + fmtDate(t0) + " " + hh(t0.getHours() + t0.getMinutes() / 60) + " to " + fmtDate(tN) + " " + hh(tN.getHours()) + "; starting room " + deg(p.t_room0) + ", battery " + p.soc0_kwh + " kWh" +
@@ -565,6 +613,27 @@ function renderTimeline() {
   });
 }
 
+/** e.g. ["16:00–19:00 20.0° → 20.5°, water −2 → 0"] */
+function describeRev(r) {
+  return (r.changed || []).map((i) => {
+    const b = r.before[i], a = r.after[i], parts = [];
+    if (Math.abs(b.temperature - a.temperature) > 1e-9) parts.push(b.temperature.toFixed(1) + "° → " + a.temperature.toFixed(1) + "°");
+    if (b.lwt_offset !== undefined && b.lwt_offset !== a.lwt_offset) parts.push("water " + sgn(b.lwt_offset) + " → " + sgn(a.lwt_offset));
+    return rng(b.from, b.to) + " " + parts.join(", ");
+  });
+}
+function renderChanges() {
+  const box = $("#changes");
+  if (!box) return;
+  const revs = S.revs || [];
+  box.hidden = !revs.length;
+  if (!revs.length) return;
+  box.innerHTML = '<div class="mini-title">Changes to this day</div><ol class="changes">' + revs.slice().reverse().map((r) =>
+    '<li class="by-' + esc(r.by) + '"><span class="who">' + (r.by === "hermes" ? "Hermes" : r.by === "you" ? "You" : "Planner") + "</span>" +
+    '<span class="when">' + esc(r.at.slice(11, 16)) + '</span><div class="what"><b>' + esc(describeRev(r).join("; ") || r.kind) + "</b>" +
+    (r.reason ? '<span class="why">' + esc(r.reason) + "</span>" : "") + "</div></li>").join("") + "</ol>";
+}
+
 /* ---------------------------------------------------------------- editor */
 let simTimer = null, simSeq = 0;
 function renderEditor() {
@@ -580,7 +649,7 @@ function renderEditor() {
   const prev = p.manual && p.manual.previous;
   un.hidden = !(p.chosen === "Your edit" && prev);
   if (!un.hidden) {
-    un.innerHTML = "<span>" + (p.kind === "outlook" ? "Your edit is pinned to this day" : "You're running your own edit") + ", pushed <b>" + esc((p.manual.at || "").replace("T", " ").slice(5, 16)) + "</b>.</span>" + '<button type="button" class="btn ghost" id="undo-btn">Undo: back to ' + esc(NAMES[prev] || prev) + "</button>";
+    un.innerHTML = "<span>" + (p.manual.by === "hermes" ? "Hermes adjusted this day" : p.kind === "outlook" ? "Your edit is pinned to this day" : "You're running your own edit") + ", pushed <b>" + esc((p.manual.at || "").replace("T", " ").slice(5, 16)) + "</b>.</span>" + '<button type="button" class="btn ghost" id="undo-btn">Undo: back to ' + esc(NAMES[prev] || prev) + "</button>";
     $("#undo-btn").onclick = undoEdit;
   }
   const ed = $("#editor");
@@ -922,6 +991,63 @@ function renderHistory() {
   }).join("");
 }
 
+/* ---------------------------------------------------------------- Hermes chat */
+let chatTimer = null;
+function chatOpen() { return !$("#chat").hidden; }
+function openChat() {
+  $("#chat").hidden = false; $("#orb").setAttribute("aria-expanded", "true");
+  try { localStorage.setItem("hp-chat-seen", String(S.chatSeen = lastId())); } catch (e) { S.chatSeen = lastId(); }
+  renderChat(); $("#orb-badge").hidden = true;
+  setTimeout(() => $("#chat-text").focus(), 50);
+  pollChat(); restartChatTimer();
+}
+function closeChat() { $("#chat").hidden = true; $("#orb").setAttribute("aria-expanded", "false"); restartChatTimer(); }
+function lastId() { return S.chat.length ? S.chat[S.chat.length - 1].id : 0; }
+function agoText(iso) {
+  if (!iso) return "not connected yet";
+  const m = Math.round((Date.now() - new Date(iso.slice(0, 19)).getTime()) / 60000);
+  return m < 2 ? "online" : m < 90 ? "last checked in " + m + " min ago" : "last checked in " + iso.slice(11, 16) + (iso.slice(0, 10) === isoDate(new Date()) ? "" : " on " + iso.slice(5, 10));
+}
+async function pollChat() {
+  try {
+    const r = await api("/api/chat?since=" + lastId());
+    S.agent = r.agent || {};
+    if (r.messages.length) { S.chat = S.chat.concat(r.messages); renderChat(); if (S.plan) renderNow(); }
+  } catch (e) { /* offline */ }
+  $("#chat-status").textContent = agoText(S.agent.last_seen);
+  const unread = S.chat.some((m) => m.id > S.chatSeen && m.from !== "you");
+  if (chatOpen()) { S.chatSeen = lastId(); try { localStorage.setItem("hp-chat-seen", String(S.chatSeen)); } catch (e) { /* ignore */ } }
+  $("#orb-badge").hidden = chatOpen() || !unread;
+  $("#orb").classList.toggle("busy", S.chat.length > 0 && S.chat[S.chat.length - 1].from === "you");
+}
+function restartChatTimer() { clearInterval(chatTimer); chatTimer = setInterval(pollChat, chatOpen() ? 4000 : 30000); }
+function renderChat() {
+  const log = $("#chat-log");
+  if (!S.chat.length) { log.innerHTML = '<li class="empty">Ask Hermes anything about today\'s heating. Hermes also posts here whenever it changes the plan, and says why.</li>'; return; }
+  log.innerHTML = S.chat.slice(-80).map((m) => '<li class="from-' + esc(m.from) + " kind-" + esc(m.kind) + '">' + esc(m.text) + "<time>" + esc(m.at.slice(11, 16)) + (m.at.slice(0, 10) !== isoDate(new Date()) ? " · " + esc(m.at.slice(5, 10)) : "") + "</time></li>").join("");
+  const pend = S.chat[S.chat.length - 1];
+  if (pend.from === "you") log.insertAdjacentHTML("beforeend", '<li class="empty">' + (S.agent.last_seen && (Date.now() - new Date(S.agent.last_seen.slice(0, 19))) < 3 * 60000 ? "Hermes is thinking…" : "Sent. Hermes will reply when it next checks in.") + "</li>");
+  log.scrollTop = log.scrollHeight;
+}
+function wireChat() {
+  try { S.chatSeen = +localStorage.getItem("hp-chat-seen") || 0; } catch (e) { S.chatSeen = 0; }
+  $("#orb").onclick = () => (chatOpen() ? closeChat() : openChat());
+  $("#chat-close").onclick = closeChat;
+  addEventListener("keydown", (e) => { if (e.key === "Escape" && chatOpen()) closeChat(); });
+  const ta = $("#chat-text");
+  ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(120, ta.scrollHeight) + "px"; });
+  ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#chat-form").requestSubmit(); } });
+  $("#chat-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = ta.value.trim();
+    if (!text) return;
+    ta.value = ""; ta.style.height = "auto";
+    try { const m = await api("/api/chat", { text }); S.chat.push(m); S.chatSeen = m.id; renderChat(); $("#orb").classList.add("busy"); }
+    catch (err) { ta.value = text; $("#chat-status").textContent = "Couldn't send: " + err.message; }
+  });
+  pollChat(); restartChatTimer();
+}
+
 /* ---------------------------------------------------------------- dialog, theme, boot */
 function confirmDlg(title, html, ok) {
   const d = $("#dlg");
@@ -945,7 +1071,7 @@ function wireTabs() {
 }
 let rz = null, wasMobile = MOBILE();
 addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (MOBILE() !== wasMobile) { wasMobile = MOBILE(); setTab(document.body.dataset.tab, false); } else drawCharts(); }, 150); });
-wireTheme(); wireEditor(); wireOcc(); wireTabs();
+wireTheme(); wireEditor(); wireOcc(); wireTabs(); wireChat();
 loadAll().catch((e) => { $("#loading").textContent = "Could not load the plan: " + e.message; });
 setInterval(loadStatus, 60000);
 setInterval(() => { if (!S.edit && document.visibilityState === "visible" && !$("#dlg").open) loadAll(); }, 300000);

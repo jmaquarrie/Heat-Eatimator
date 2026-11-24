@@ -16,12 +16,20 @@ Python stdlib only. Runs on LXC 122 as `heatplanner-web` (port 8110) plus two ti
 | Status chips | Plan pushed and verified, whether the thermostat is following the plan, Daikin API calls left, live grid power (if a meter is configured) |
 | Now | Room now against target and against what the model predicted, the next setpoint change, today's setpoints with a "now" marker, tariff now and next, battery, outside, heating state |
 | Plan | Headline in real pounds with comfort kept separate, plus a shared-time chart: room against setpoint and comfort floors, outside temperature, pump kWh per hour, battery, Cosy and Peak shading, hover readout. **Drag the handles** on the setpoint line to try changes |
-| Edit | ±0.5 °C and water offset per block with instant re-simulation (`/api/simulate`, no HA calls); push with confirmation; **undo** puts the optimiser's plan back. Shows the **next day** by default. A day picker (and clicking a Week card) opens any week-ahead day; pushing one **pins** the edit, which the 22:00 run the night before keeps. **Edit today's plan** on the Now card opens today, with blocks that have ended locked |
+| Edit | ±0.5 °C and water offset per block with instant re-simulation (`/api/simulate`, no HA calls); push with confirmation; **undo** puts the optimiser's plan back. **Every view opens on today**; a day picker and the Week cards open any later day (pushing one pins the edit, which the 22:00 run the night before keeps). Blocks that have ended are locked |
 | Compare | Strategy cards led by electricity in pounds and comfort as "time below 19.5°"; the model score and its breakdown are folded away under "How the planner scores a plan" |
 | Week | Six-day preview: electricity per day against routine, comfort, setpoint strip |
 | Who's home | Weekly pattern plus a two-week calendar; tap a day to cycle Home, Out and Away |
 | Model | Data-maturity banner, fitted parameters, backtest bars, yesterday predicted against measured, and **measured grid import and cost** from your meter |
 | History | Recent plans, activity log |
+
+Changes made during the day (by you, by Hermes or by an undo) are drawn on the chart: the setpoint as
+first planned (dotted), a marker at each change (**H** = Hermes, **Y** = you) with its reason, measured room
+temperature so far today, and a "Changes to this day" list.
+
+**Hermes chat:** the orb in the bottom-right corner opens a chat with Hermes. Hermes's change updates appear
+there and on the Now card. See [HERMES_AGENT.md](HERMES_AGENT.md) for the agent API (state, projection from
+now, suggest, guarded adjust, messages, webhook).
 
 On phones the sections become five tabs (Now, Plan, Week, Home, More) with a bottom tab bar.
 Light and dark themes.
@@ -97,6 +105,9 @@ profitable.
 | GET | `/api/actuals?date=YYYY-MM-DD` | measured hourly room / kWh beside that day's prediction (default yesterday) |
 | POST | `/api/simulate` `{"date", "values":[7 setpoints], "offsets":[7]}` | what-if for any editable day, read-only |
 | POST | `/api/push` `{"date", "values", "offsets"}` | writes that day's weekday in `schedule.heat_pump_planner` only (week-ahead days are also pinned in `data/day_overrides.json`) |
+| GET/POST | `/api/chat` | dashboard chat with Hermes |
+| GET | `/api/revisions?date=` | changes made to a day (who, when, why, before/after) |
+| * | `/api/agent/*` | Hermes's API, keyed with `HEATPLANNER_AGENT_KEY`: see HERMES_AGENT.md |
 | GET | `/api/day?date=` | plan-shaped view of any editable day (the plan day, the rest of today, a week-ahead day) |
 | POST | `/api/restore` `{"date"}` | undo a hand edit: re-push the planner's choice (for a week-ahead day, drop the pin) |
 | POST | `/api/occupancy`, `/api/rerun` | as before |

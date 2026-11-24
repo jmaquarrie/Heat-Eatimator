@@ -3,7 +3,7 @@ import datetime as dt
 import json
 from zoneinfo import ZoneInfo
 
-from . import data, model
+from . import data, model, revisions
 
 LOCAL = ZoneInfo("Europe/London")
 DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -272,6 +272,7 @@ def build_plan(ha, cfg, params, now=None, wx=None):
                       "week": [{"date": (today + dt.timedelta(days=i)).isoformat(), "weekday": DAYS[(today + dt.timedelta(days=i)).weekday()],
                                 "status": model.day_status(cfg, today + dt.timedelta(days=i))} for i in range(0, 8)]},
     }
+    plan["original_blocks_raw"] = plan["blocks_raw"]          # as planned at 22:00, before any edits through the day
     if manual:
         plan["manual"] = manual
     plan["outlook"] = build_outlook(ha, cfg, params, wx, ctx["start_dt"], chosen_vals, cur_off if use_off else None, ocands)
@@ -392,7 +393,18 @@ def simulate_values(cfg, plan, values, offsets=None, today_values=None, today_of
     return out
 
 
-def push_values(ha, cfg, plan, values, offsets=None):
+def full_trace(cfg, plan, values, offsets, today_values=None, today_offsets=None):
+    """Full simulation trace (all fields the charts use) for the plan window with these values."""
+    ctx, fixed, params, _, fixed_off = sim_context(cfg, plan)
+    if today_values is not None:
+        fixed = model.blocks_from_values(cfg, today_values)
+        if fixed_off is not None and today_offsets is not None:
+            fixed_off = model.blocks_from_values(cfg, today_offsets)
+    return model.evaluate(cfg, params, ctx, fixed, values, trace=True, offsets=offsets if fixed_off is not None else None,
+                          fixed_off=fixed_off)["trace"]
+
+
+def push_values(ha, cfg, plan, values, offsets=None, by="you", reason=None):
     """Push a hand-edited set of setpoints (and offsets) for the plan's day, and record it in the plan."""
     if dt.date.fromisoformat(plan["for_date"]) < dt.datetime.now(LOCAL).date():
         raise ValueError("the latest plan is for %s, which has passed; re-run the model first" % plan["for_date"])
@@ -403,27 +415,33 @@ def push_values(ha, cfg, plan, values, offsets=None):
     previous = (plan.get("manual") or {}).get("previous") if plan["chosen"] == "Your edit" else plan["chosen"]
     plan = dict(plan)
     plan["blocks"] = res["blocks"]
-    plan["blocks_raw"] = plan_blocks(cfg, res["values"], res["offsets"], raw=True)
     plan["strategies"] = dict(plan["strategies"])
     plan["strategies"]["Your edit"] = {"values": res["values"], "offsets": res["offsets"], **{k: res[k] for k in SUMMARY_KEYS}}
     plan["chosen"] = "Your edit"
     plan["saving_vs_current_gbp"] = round(plan["strategies"]["Current routine"]["total"] - res["total"], 3)
+    before_v, before_o = [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan)
+    plan["blocks_raw"] = plan_blocks(cfg, res["values"], res["offsets"], raw=True)
     plan["manual"] = {"at": dt.datetime.now(LOCAL).isoformat(timespec="seconds"), "values": res["values"], "trace": res["trace"],
-                      "previous": previous}
+                      "previous": previous, "by": by, "reason": reason}
+    plan["trace_best"] = full_trace(cfg, plan, res["values"], res["offsets"])   # the chart now shows what's in force
     plan["pushed"] = push(ha, cfg, plan)
     save_plan(plan)
+    revisions.record(cfg, plan["for_date"], by, before_v, before_o, res["values"], res["offsets"], reason)
     return plan
 
 
-def restore_plan(ha, cfg, plan):
+def restore_plan(ha, cfg, plan, by="you"):
     """Undo a hand edit: push the strategy the planner had chosen before, and drop the edit."""
     prev = (plan.get("manual") or {}).get("previous")
     if plan["chosen"] != "Your edit" or not prev or prev not in plan["strategies"]:
         raise ValueError("there is no hand edit to undo")
     plan = dict(plan)
     vals, offs = plan["strategies"][prev]["values"], plan["strategies"][prev].get("offsets")
+    revisions.record(cfg, plan["for_date"], by, [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan), vals, offs,
+                     "Undo: back to the planner's choice", kind="undo")
     plan["blocks"] = plan_blocks(cfg, vals, offs)
     plan["blocks_raw"] = plan_blocks(cfg, vals, offs, raw=True)
+    plan["trace_best"] = full_trace(cfg, plan, vals, offs)
     plan["strategies"] = {k: v for k, v in plan["strategies"].items() if k != "Your edit"}
     plan["chosen"] = prev
     plan["saving_vs_current_gbp"] = round(plan["strategies"]["Current routine"]["total"] - plan["strategies"][prev]["total"], 3)
@@ -479,8 +497,8 @@ def build_outlook(ha, cfg, params, wx, start, chosen_vals, cur_off=None, ocands=
             ctx, _ = make_ctx(ha, cfg, params, now=s_dt, wx=wx, room=19.8, soc=cfg["battery"]["reserve_kwh"] + 3)
             fixed = model.blocks_from_values(cfg, steady)
             fixed_off = model.blocks_from_values(cfg, offs0) if use_off else None
-            vals, offs, _ = model.optimise(cfg, params, ctx, fixed, [steady, routine], passes=3, offsets=offs0, fixed_off=fixed_off,
-                                           tune_offsets=use_off, offset_cands=ocands)
+            vals, offs, _ = model.optimise(cfg, params, ctx, fixed, [steady], passes=3, offsets=offs0, fixed_off=fixed_off,
+                                           tune_offsets=use_off, offset_cands=ocands, offset_starts=2)
             r = model.evaluate(cfg, params, ctx, fixed, vals, offsets=offs, fixed_off=fixed_off)
             cur = model.evaluate(cfg, params, ctx, fixed, routine, offsets=offs0, fixed_off=fixed_off)
             tm = [v["t"] for t, v in wx if t.date() == day]
@@ -646,13 +664,17 @@ def simulate_for_date(cfg, plan, date_iso, values, offsets=None):
     return _sim_out(cfg, r, values, offsets)
 
 
-def push_future(ha, cfg, plan, date_iso, values, offsets=None):
+def push_future(ha, cfg, plan, date_iso, values, offsets=None, by="you", reason=None):
     """Pin a hand edit to a week-ahead day and write that weekday in the helper now."""
     if day_kind(plan, date_iso) != "outlook":
         raise ValueError("not a week-ahead day")
+    before = day_view(cfg, plan, date_iso)
     res = simulate_for_date(cfg, plan, date_iso, values, offsets)
     blocks = res["blocks"]
     validate(cfg, blocks)
+    revisions.record(cfg, date_iso, by, [b["temperature"] for b in before["blocks_raw"]],
+                     [b.get("lwt_offset") for b in before["blocks_raw"]] if res["offsets"] is not None else None,
+                     res["values"], res["offsets"], reason)
     day = dt.date.fromisoformat(date_iso)
     pushed = push_day(ha, cfg, DAYS[day.weekday()], blocks)
     ov = load_overrides()
@@ -666,8 +688,13 @@ def restore_future(ha, cfg, plan, date_iso):
     ov = load_overrides()
     if date_iso not in ov:
         raise ValueError("there is no edit to undo for %s" % date_iso)
-    del ov[date_iso]
+    old = ov.pop(date_iso)
     save_overrides(ov)
+    o0 = next(x for x in plan["outlook"] if x.get("date") == date_iso)
+    revisions.record(cfg, date_iso, "you", old["values"], old.get("offsets"),
+                     _sample_blocks(cfg, o0["blocks"], "temperature", 20.0),
+                     _sample_blocks(cfg, o0["blocks"], "lwt_offset", 0) if old.get("offsets") is not None else None,
+                     "Undo: back to the planner's preview", kind="undo")
     o = next(x for x in plan["outlook"] if x.get("date") == date_iso)
     day = dt.date.fromisoformat(date_iso)
     pushed = push_day(ha, cfg, DAYS[day.weekday()], o["blocks"])
@@ -689,7 +716,7 @@ def annotate_outlook(cfg, plan):
     return plan
 
 
-def push_today(ha, cfg, plan, values, offsets=None):
+def push_today(ha, cfg, plan, values, offsets=None, by="you", reason=None):
     """After 22:00 the plan is for tomorrow; this changes the rest of TODAY in the helper (blocks not yet
     ended), leaving tomorrow's plan as it is. Records the change in the plan's sim block."""
     if not today_tail_available(plan):
@@ -706,10 +733,12 @@ def push_today(ha, cfg, plan, values, offsets=None):
     blocks = plan_blocks(cfg, new_vals, new_offs)
     validate(cfg, blocks)
     pushed = push_day(ha, cfg, DAYS[today.weekday()], blocks)
+    revisions.record(cfg, today.isoformat(), by, old_vals, old_offs, new_vals, new_offs, reason)
     plan = dict(plan)
     plan["sim"] = dict(s, fixed=[[a, b, v] for (a, b), v in zip(cfg["blocks"], new_vals)],
                        fixed_off=[[a, b, o] for (a, b), o in zip(cfg["blocks"], new_offs)] if new_offs is not None else s.get("fixed_off"))
     plan["fixed_today_tail"] = [{"from": a, "to": b, "temperature": v} for (a, b), v in zip(cfg["blocks"], new_vals) if b > 20]
+    plan["trace_best"] = full_trace(cfg, plan, [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan))
     plan["today_edit"] = {"at": pushed["at"], "date": today.isoformat(), "blocks": blocks, "verified": pushed["verified"],
                           "total": res["total"], "grid_cost": res["grid_cost"]}
     save_plan(plan)

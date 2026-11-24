@@ -358,20 +358,31 @@ def offset_candidates(cfg, lo=None, hi=None):
 
 
 def optimise(cfg, params, ctx, fixed, starts, use_battery=True, passes=4, offsets=None, fixed_off=None, tune_offsets=False,
-             offset_cands=None):
+             offset_cands=None, offset_starts=4):
     """Coordinate descent. starts: list of setpoint lists. offsets: starting offsets (also used as-is when
-    tune_offsets is False). Returns (setpoints, offsets_or_None, total)."""
+    tune_offsets is False). Returns (setpoints, offsets_or_None, total).
+
+    With tune_offsets the search does not just start from the offset currently set on the pump (which made it
+    "stick" to the last value wherever the offset barely matters): it also starts from several uniform offsets,
+    and besides single-block moves it tries moving a whole run of consecutive blocks at once, which costs one
+    write instead of two and so isn't blocked by the write price."""
     cands = cfg["optimiser"]["candidates"]
     ocands = offset_cands if offset_cands is not None else offset_candidates(cfg)
-    best_all = None
-    for start in starts:
-        vals = list(start)
-        offs = list(offsets) if offsets is not None else None
-        ev = lambda v, o: evaluate(cfg, params, ctx, fixed, v, use_battery, offsets=o, fixed_off=fixed_off)["total"]
-        best = ev(vals, offs)
-        for _ in range(passes):
+    n = len(cfg["blocks"])
+    ev = lambda v, o: evaluate(cfg, params, ctx, fixed, v, use_battery, offsets=o, fixed_off=fixed_off)["total"]
+    pairs = [(list(st), list(offsets) if offsets is not None else None) for st in starts]
+    if tune_offsets and offsets is not None and ocands:
+        lo, hi = min(ocands), max(ocands)
+        picks = [0, len(ocands) // 4, len(ocands) // 2, (3 * len(ocands)) // 4][:max(0, offset_starts)]
+        uni = sorted({ocands[k] for k in picks})
+        for st in starts[:1]:
+            for u in uni:
+                if [u] * n != list(offsets):
+                    pairs.append((list(st), [u] * n))
+    def descend(vals, offs, best, max_passes):
+        for _ in range(max_passes):
             improved = False
-            for i in range(len(vals)):
+            for i in range(n):
                 for cand in cands:
                     if cand == vals[i]:
                         continue
@@ -389,8 +400,33 @@ def optimise(cfg, params, ctx, fixed, starts, use_battery=True, passes=4, offset
                             best, offs[i], improved = s_, cand, True
             if not improved:
                 break
-        if best_all is None or best < best_all[2]:
-            best_all = (list(vals), offs, best)
+        return vals, offs, best
+
+    def runs(vals, offs, best):
+        # set blocks i..j to one offset in a single step (one write instead of two)
+        improved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                for cand in ocands:
+                    if all(o == cand for o in offs[i:j + 1]):
+                        continue
+                    trial = offs[:i] + [cand] * (j - i + 1) + offs[j + 1:]
+                    s_ = ev(vals, trial)
+                    if s_ < best - 1e-6:
+                        best, offs, improved = s_, trial, True
+        return offs, best, improved
+
+    best_all = None
+    for vals, offs in pairs:
+        vals, offs, b = descend(vals, offs, ev(vals, offs), passes)
+        if tune_offsets and offs is not None:
+            for _ in range(2):
+                offs, b, improved = runs(vals, offs, b)
+                if not improved:
+                    break
+                vals, offs, b = descend(vals, offs, b, passes)
+        if best_all is None or b < best_all[2] - 1e-9:
+            best_all = (list(vals), list(offs) if offs is not None else None, b)
     return best_all
 
 

@@ -71,7 +71,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(new["chosen"], "Your edit")
         self.assertTrue(new["pushed"]["verified"])
         day = ha.helper[new["weekday"]]
-        self.assertEqual([b["data"]["temperature"] for b in day], vals)
+        self.assertEqual([b["data"]["temperature"] for b in day], [b["temperature"] for b in planner.plan_blocks(self.cfg, vals, new["strategies"]["Your edit"]["offsets"])])
         self.assertEqual(ha.live["saturday"], live_before)
         self.assertEqual(data.load_json("plan_latest.json", None)["chosen"], "Your edit")
         planner.publish_sensors(ha, self.cfg, new)
@@ -206,6 +206,43 @@ class Offline(unittest.TestCase):
         self.assertTrue(p["manual"]["pinned"])
         self.assertIn("Optimised", p["strategies"])                      # still compared against the optimiser
         data.DATA_DIR = self.tmp
+
+    def test_agent_projection_suggest_and_guard_rails(self):
+        from heatplanner import agent, revisions
+        ha = self.fake()
+        ha.state = lambda e: {"state": {"sensor.heat_pump_climate_control_room_temperature": "19.2",
+                                        "sensor.marstek_m1_battery_state_of_charge": "60"}.get(e, "0"), "attributes": {}}
+        cfg = self.cfg
+        p = planner.project_today(ha, cfg, self.plan) if hasattr(planner, "project_today") else agent.project_today(ha, cfg, self.plan)
+        self.assertEqual(p["room_now"], 19.2)                         # starts from the measured room, not last night's guess
+        self.assertTrue(p["trace"])
+        sg = agent.suggest_today(ha, cfg, self.plan)
+        self.assertGreaterEqual(sg["score_gain_gbp"], -1e-9)          # never worse than what's in force
+        for i in sg["locked_blocks"]:                                 # ended blocks untouched
+            self.assertEqual(sg["suggested"]["values"][i], sg["current"]["values"][i])
+        with self.assertRaises(ValueError):                           # reason required
+            agent.adjust(ha, cfg, self.plan, sg["suggested"]["values"], sg["suggested"]["offsets"], "")
+        big = list(sg["current"]["values"]); big[6] = min(22, big[6] + 3) if big[6] <= 19 else big[6] - 3
+        with self.assertRaises(ValueError):                           # more than 2 °C in one go
+            agent.adjust(ha, cfg, self.plan, big, sg["current"]["offsets"], "testing a big jump")
+        vals = list(sg["current"]["values"]); vals[6] = vals[6] + 0.5 if vals[6] < 22 else vals[6] - 0.5
+        res = agent.adjust(ha, cfg, self.plan, vals, sg["current"]["offsets"], "House is running cool, warming the evening")
+        self.assertEqual(res["revision"]["by"], "hermes")
+        self.assertEqual(res["message"]["kind"], "update")
+        self.assertIn("warming the evening", res["message"]["text"])
+        with self.assertRaises(ValueError):                           # too soon after the last adjustment
+            agent.adjust(ha, cfg, data.load_json("plan_latest.json", None), sg["current"]["values"], sg["current"]["offsets"], "and back again")
+        self.assertTrue(any(r["by"] == "hermes" for r in revisions.for_date(self.plan["for_date"])))
+        data.save_json("plan_latest.json", self.plan)
+
+    def test_chat_channel(self):
+        from heatplanner import agent
+        m1 = agent.chat_add("you", "Can you warm the snug for 7pm?")
+        agent.chat_add("hermes", "Will do.")
+        self.assertEqual([m["from"] for m in agent.chat_since(m1["id"] - 1)], ["you", "hermes"])
+        self.assertEqual(len(agent.chat_since(0, "you")), len([m for m in agent.chat_load()["messages"] if m["from"] == "you"]))
+        agent.mark_read(m1["id"])
+        self.assertEqual(agent.status_cursor(), m1["id"])
 
     def test_comfort_hours_and_grid_meter(self):
         for r in self.plan["strategies"].values():

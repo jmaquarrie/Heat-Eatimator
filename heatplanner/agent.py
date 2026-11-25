@@ -16,13 +16,7 @@ from . import data, model, planner, revisions
 LOCAL = ZoneInfo("Europe/London")
 CHAT = "chat.json"
 STATE = "agent_state.json"
-DEFAULTS = {
-    "max_adjustments_per_day": 8,      # agent pushes per calendar day
-    "min_minutes_between": 20,         # between agent pushes
-    "max_setpoint_change_c": 2.0,      # vs the values in force when it adjusts
-    "webhook_url": "",                 # optional: POSTed on each chat message and at check-in times
-    "checkin_times": [],               # e.g. ["07:00", "12:30", "16:30"]: POST {"type": "checkin"} to webhook_url
-}
+DEFAULTS = model.DEFAULT_CONFIG["agent"]   # max_adjustments_per_day, min_minutes_between, max_setpoint_change_c, ...
 
 
 def settings(cfg):

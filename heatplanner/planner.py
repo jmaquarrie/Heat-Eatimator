@@ -247,6 +247,17 @@ def build_plan(ha, cfg, params, now=None, wx=None):
         results["Your edit"] = summary(p_vals, p_offs, ev(p_vals, p_offs))
         manual = {"at": pinned.get("at"), "values": p_vals, "previous": chosen_name, "pinned": True}
         chosen_name = "Your edit"
+    from . import ai as ai_mod                      # set by Hermes for this day (based on the Optimised plan)
+    air = ai_mod.load().get(tomorrow.isoformat())
+    if air:
+        a_vals = check_values(cfg, air["values"])
+        a_offs = [round(float(o)) for o in (air.get("offsets") or cur_offs)] if use_off else None
+        results["AI routine"] = dict(summary(a_vals, a_offs, ev(a_vals, a_offs)), reason=air.get("reason"), at=air.get("at"),
+                                     applied=air.get("applied", False))
+        if air.get("applied") and not pinned:
+            manual = {"at": air.get("applied_at") or air.get("at"), "values": a_vals, "previous": chosen_name, "by": "hermes",
+                      "reason": air.get("reason")}
+            chosen_name = "AI routine"
     chosen_vals, chosen_offs = results[chosen_name]["values"], results[chosen_name]["offsets"]
     tm = [(t, v) for t, v in fc if t.date() == tomorrow]
     compare = {}
@@ -415,7 +426,21 @@ def full_trace(cfg, plan, values, offsets, today_values=None, today_offsets=None
                           fixed_off=fixed_off)["trace"]
 
 
-def push_values(ha, cfg, plan, values, offsets=None, by="you", reason=None):
+EDITS = ("Your edit", "AI routine")
+
+
+def full_trace_for_date(cfg, plan, date_iso, values, offsets=None):
+    kind = day_kind(plan, date_iso)
+    if kind == "plan":
+        return full_trace(cfg, plan, values, offsets)
+    if kind == "today_tail":
+        return full_trace(cfg, plan, [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan), values, offsets)
+    ctx, fixed, fixed_off, params, cur, _ = outlook_ctx(cfg, plan, date_iso)
+    return model.evaluate(cfg, params, ctx, fixed, values, trace=True, offsets=offsets if fixed_off is not None else None,
+                          fixed_off=fixed_off)["trace"]
+
+
+def push_values(ha, cfg, plan, values, offsets=None, by="you", reason=None, name="Your edit"):
     """Push a hand-edited set of setpoints (and offsets) for the plan's day, and record it in the plan."""
     if dt.date.fromisoformat(plan["for_date"]) < dt.datetime.now(LOCAL).date():
         raise ValueError("the latest plan is for %s, which has passed; re-run the model first" % plan["for_date"])
@@ -423,12 +448,14 @@ def push_values(ha, cfg, plan, values, offsets=None, by="you", reason=None):
     # blocks of the plan's day that have already ended (when the plan is for today) can't change
     check_unchanged(cfg, ended_blocks(cfg, dt.date.fromisoformat(plan["for_date"])), [b["temperature"] for b in plan["blocks_raw"]],
                     res["values"], plan_offsets(plan), res["offsets"])
-    previous = (plan.get("manual") or {}).get("previous") if plan["chosen"] == "Your edit" else plan["chosen"]
+    previous = (plan.get("manual") or {}).get("previous") if plan["chosen"] in EDITS else plan["chosen"]
     plan = dict(plan)
     plan["blocks"] = res["blocks"]
     plan["strategies"] = dict(plan["strategies"])
-    plan["strategies"]["Your edit"] = {"values": res["values"], "offsets": res["offsets"], **{k: res[k] for k in SUMMARY_KEYS}}
-    plan["chosen"] = "Your edit"
+    plan["strategies"][name] = {"values": res["values"], "offsets": res["offsets"], **{k: res[k] for k in SUMMARY_KEYS}}
+    if name == "AI routine":
+        plan["strategies"][name]["reason"] = reason
+    plan["chosen"] = name
     plan["saving_vs_current_gbp"] = round(plan["strategies"]["Current routine"]["total"] - res["total"], 3)
     before_v, before_o = [b["temperature"] for b in plan["blocks_raw"]], plan_offsets(plan)
     plan["blocks_raw"] = plan_blocks(cfg, res["values"], res["offsets"], raw=True)
@@ -444,7 +471,7 @@ def push_values(ha, cfg, plan, values, offsets=None, by="you", reason=None):
 def restore_plan(ha, cfg, plan, by="you"):
     """Undo a hand edit: push the strategy the planner had chosen before, and drop the edit."""
     prev = (plan.get("manual") or {}).get("previous")
-    if plan["chosen"] != "Your edit" or not prev or prev not in plan["strategies"]:
+    if plan["chosen"] not in EDITS or not prev or prev not in plan["strategies"]:
         raise ValueError("there is no hand edit to undo")
     plan = dict(plan)
     vals, offs = plan["strategies"][prev]["values"], plan["strategies"][prev].get("offsets")

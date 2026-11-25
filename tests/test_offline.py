@@ -29,6 +29,7 @@ class Offline(unittest.TestCase):
         data.DATA_DIR = self.tmp
         self.cfg = data.load_config()
         self.plan = data.load_json("plan_latest.json", None)
+        self.addCleanup(data.save_json, "plan_latest.json", json_copy(self.plan))
 
     def keep_ended(self, vals, base):
         """Edits may only touch blocks that haven't ended yet (the demo plan is for today)."""
@@ -158,8 +159,9 @@ class Offline(unittest.TestCase):
             bad = list(tv); bad[0] = old_today[0] + 1
             with self.assertRaises(ValueError):
                 planner.push_today(ha, self.cfg, new, bad, offs)
-        with self.assertRaises(ValueError):                             # plan for today: use the normal editor
-            planner.push_today(ha, self.cfg, self.plan, tv, offs)
+        if self.plan["for_date"] == now.date().isoformat():          # plan for today: use the normal editor
+            with self.assertRaises(ValueError):
+                planner.push_today(ha, self.cfg, self.plan, tv, offs)
         data.save_json("plan_latest.json", self.plan)
 
     def test_week_ahead_view_pin_and_undo(self):
@@ -213,7 +215,8 @@ class Offline(unittest.TestCase):
         ha.state = lambda e: {"state": {"sensor.heat_pump_climate_control_room_temperature": "19.2",
                                         "sensor.marstek_m1_battery_state_of_charge": "60"}.get(e, "0"), "attributes": {}}
         cfg = self.cfg
-        p = planner.project_today(ha, cfg, self.plan) if hasattr(planner, "project_today") else agent.project_today(ha, cfg, self.plan)
+        self.addCleanup(data.save_json, "plan_latest.json", json_copy(self.plan))   # restore even if an assert fails
+        p = agent.project_today(ha, cfg, self.plan)
         self.assertEqual(p["room_now"], 19.2)                         # starts from the measured room, not last night's guess
         self.assertTrue(p["trace"])
         sg = agent.suggest_today(ha, cfg, self.plan)
@@ -233,8 +236,8 @@ class Offline(unittest.TestCase):
         self.assertIn("warming the evening", res["message"]["text"])
         with self.assertRaises(ValueError):                           # too soon after the last adjustment
             agent.adjust(ha, cfg, data.load_json("plan_latest.json", None), sg["current"]["values"], sg["current"]["offsets"], "and back again")
-        self.assertTrue(any(r["by"] == "hermes" for r in revisions.for_date(self.plan["for_date"])))
-        data.save_json("plan_latest.json", self.plan)
+        today = agent.now_local().date().isoformat()                  # after 22:00 Hermes adjusts the rest of today
+        self.assertTrue(any(r["by"] == "hermes" for r in revisions.for_date(today) + revisions.for_date(self.plan["for_date"])))
 
     def test_points_score(self):
         self.assertEqual(planner.score_points(5.0, 5.0), 100)          # routine = 100
@@ -275,6 +278,52 @@ class Offline(unittest.TestCase):
             self.assertTrue(data.load_json("settings_log.json", []))
         finally:
             data.save_json("config.json", before)
+
+    def test_focus_slider_scales_comfort(self):
+        from heatplanner import model
+        ctx, fixed, params, _, fo = planner.sim_context(self.cfg, self.plan)
+        cold = [16.0] * 7
+        pens = []
+        for f in range(5):
+            c = dict(self.cfg, comfort=dict(self.cfg["comfort"], focus=f))
+            pens.append(model.evaluate(c, params, ctx, fixed, cold, offsets=[0] * 7 if fo else None, fixed_off=fo)["penalty"])
+        self.assertTrue(all(a < b for a, b in zip(pens, pens[1:])), pens)       # more comfort focus = being cold costs more
+        from heatplanner import settings
+        self.assertEqual(settings.parse("comfort.focus", 4), 4)
+        with self.assertRaises(ValueError):
+            settings.parse("comfort.focus", 7)
+
+    def test_ai_routine_base_evaluate_set_apply(self):
+        import datetime as dt
+        from heatplanner import ai
+        today, tomorrow = ai.allowed_dates()
+        ha = self.fake()
+        for d in (today, tomorrow):
+            try:
+                b = ai.base(self.cfg, self.plan, d)
+            except ValueError:
+                continue                                                  # e.g. no plan covers that day in this demo
+            self.assertIn(b["name"], ("Optimised", "Today's plan"))
+            vals = list(b["values"]); offs = b["offsets"]
+            vals[6] = min(self.cfg["comfort"]["max_setpoint_c"], vals[6] + 1.0)   # 22-24 never ends early
+            ev = ai.evaluate(self.cfg, self.plan, d, vals, offs)
+            self.assertIn("score", ev["summary"]); self.assertIn("vs_base", ev)
+            with self.assertRaises(ValueError):                            # reason required
+                ai.set_routine(ha, self.cfg, self.plan, d, vals, offs, "")
+            far = list(b["values"]); far[6] = b["values"][6] + 4 if b["values"][6] <= 18 else b["values"][6] - 4
+            with self.assertRaises(ValueError):                            # too far from Optimised
+                ai.set_routine(ha, self.cfg, self.plan, d, far, offs, "Testing a big difference from optimised")
+            res = ai.set_routine(ha, self.cfg, self.plan, d, vals, offs, "Colder evening forecast than the model assumed.", apply=True)
+            self.assertTrue(res["routine"]["applied"])
+            self.assertEqual(ha.helper[planner.DAYS[dt.date.fromisoformat(d).weekday()]][-1]["data"]["temperature"], vals[6])
+            view = self.plan if d == self.plan["for_date"] else planner.day_view(self.cfg, self.plan, d)
+            view = ai.inject(self.cfg, self.plan, json_copy(view), d)
+            self.assertIn("AI routine", view["strategies"])
+            ai.clear(d)
+            self.plan = json_copy(self.plan)
+            data.save_json("plan_latest.json", self.plan)
+        with self.assertRaises(ValueError):                                # only today or tomorrow
+            ai.base(self.cfg, self.plan, (dt.date.fromisoformat(tomorrow) + dt.timedelta(days=2)).isoformat())
 
     def test_chat_channel(self):
         from heatplanner import agent

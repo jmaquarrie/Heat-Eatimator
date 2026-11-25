@@ -71,6 +71,23 @@ and the reset button returns it to the fitted value. **Preview impact** re-score
 re-optimises the day under the proposed settings, before you save. Saves are logged (`settings_log.json`).
 The schedules the planner writes to can't be changed here.
 
+### Cost or comfort
+The top of Settings has a five-level slider: Max savings, Lean savings, Balanced (default), Lean comfort,
+Max comfort.
+- It scales how much time below comfort counts in the score: ×0.25, ×0.5, ×1, ×2 and ×4.
+- It moves the daytime comfort line by −0.5° to +0.5°, never above your comfortable temperature.
+- "Time below comfort" is still reported against your real comfort floor, so figures compare across levels.
+
+### AI routine
+Hermes can set an **AI routine** for today or tomorrow, starting from the Optimised plan and within
+`agent.ai_max_deviation_c` of it. It appears with an AI badge and a purple-to-pink border:
+- in Compare,
+- in the Plan view (a "Hermes suggested…" banner with **Use the AI routine**),
+- in the day picker and the Week cards,
+- as a header chip when it's in force today.
+
+The 22:00 run keeps an applied AI routine for its day. Hermes's endpoints are in HERMES_AGENT.md.
+
 ### Score (points) vs money
 Every plan gets a **score in points, with your routine = 100**:
 `100 + 100 × (routine total − plan total) ÷ routine total`, where the total is electricity plus a price on

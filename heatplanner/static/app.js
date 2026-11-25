@@ -12,13 +12,15 @@ const NAMES = {
   "Steady comfort temp (battery covers gaps)": "Steady 20°",
   "Cosy windows only (floors off-peak)": "Cosy windows only",
   "Your edit": "Your edit",
+  "AI routine": "AI routine",
 };
 // colour follows the entity everywhere on the page
 const COLOR = {
+  "AI routine": "var(--ai)",
   "Optimised": "var(--plan)", "Your edit": "var(--edit)", "Steady comfort temp (battery covers gaps)": "var(--s3)",
   "Cosy windows only (floors off-peak)": "var(--s4)", "Current routine": "var(--muted)",
 };
-const ORDER = ["Optimised", "Current routine", "Steady comfort temp (battery covers gaps)", "Cosy windows only (floors off-peak)", "Your edit"];
+const ORDER = ["AI routine", "Optimised", "Current routine", "Steady comfort temp (battery covers gaps)", "Cosy windows only (floors off-peak)", "Your edit"];
 const TABS = ["now", "plan", "week", "home", "more"];
 const MOBILE = () => matchMedia("(max-width: 759px)").matches;
 
@@ -47,6 +49,8 @@ function scoreOf(total, routineTotal) {
   const R = routineTotal != null ? routineTotal : (V().strategies["Current routine"] || {}).total;
   return R > 0.1 ? Math.round(100 + (100 * (R - total)) / R) : null;
 }
+/** Small "AI" badge with sparkles, used wherever Hermes's AI routine appears. */
+const AI_ICON = '<span class="ai-badge" title="Set by Hermes (AI)"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 1l1.6 4.4L14 7l-4.4 1.6L8 13l-1.6-4.4L2 7l4.4-1.6z" fill="currentColor"/><path d="M13 10.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6z" fill="currentColor"/></svg>AI</span>';
 const pts = (v) => (v == null ? "–" : String(v));
 const pence = (r) => Math.round(r * 1000) / 10 + "p";
 
@@ -139,7 +143,8 @@ function renderDayPick() {
   const html = opts.map((iso) => {
     const d = dateOf(iso), lab = iso === t ? "Today" : WD[wdIdx(d)] + " " + d.getDate();
     const tag = iso === t ? "now" : iso === S.plan.for_date ? "planned" : wk[iso] && wk[iso].edited ? "your edit" : "preview";
-    return '<button type="button" class="dp' + (iso === S.sel ? " on" : "") + '" data-day="' + iso + '" aria-pressed="' + (iso === S.sel) + '"><b>' + lab + "</b>" + (tag ? "<small>" + tag + "</small>" : "") + "</button>";
+    const hasAI = !!aiDays()[iso];
+    return '<button type="button" class="dp' + (iso === S.sel ? " on" : "") + (hasAI ? " ai" : "") + '" data-day="' + iso + '" aria-pressed="' + (iso === S.sel) + '"><b>' + lab + "</b>" + (hasAI ? "<small>" + (aiDays()[iso].applied ? "AI routine" : "AI suggestion") + "</small>" : tag ? "<small>" + tag + "</small>" : "") + "</button>";
   }).join("");
   document.querySelectorAll(".daypick").forEach((el) => {
     el.innerHTML = html;
@@ -169,6 +174,7 @@ function lockedIdx() {
 }
 function editing() { return !!(S.editRes && ((S.edit && !sameVals(S.edit, baseVals())) || (S.editOff && offOn() && !sameVals(S.editOff, baseOffs())))); }
 function chosenLabel() { const v = V(); return v.chosen === "Your edit" && v.manual && v.manual.by === "hermes" ? "Hermes-adjusted" : NAMES[v.chosen] || v.chosen; }
+function aiDays() { return Object.assign({}, S.plan.ai_days || {}); }
 function isDark() { const t = document.documentElement.dataset.theme; return t ? t === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; }
 
 function seqColor(v) {
@@ -266,6 +272,8 @@ function renderChips() {
   const ps = S.plan.pushed;
   if (ps) out.push(ps.verified ? chip("good", "Plan pushed <b>" + esc(ps.at.slice(11, 16)) + "</b> · verified", "Written to " + ps.entity + " and read back") : chip("crit", "Push <b>not verified</b>", "The helper did not read back the same blocks"));
   else out.push(chip("warn", "Preview only, <b>not pushed</b>"));
+  const tAI = aiDays()[isoDate(new Date())];
+  if (tAI && tAI.applied) out.push('<span class="chip ai-chip">' + AI_ICON + "<span>AI routine in force today</span></span>");
   const st = S.status;
   if (!st) out.push(chip("", "Checking Home Assistant…"));
   else if (!st.available) out.push(chip("warn", "Live data unavailable", st.error));
@@ -325,6 +333,25 @@ function renderNow() {
     latestUpdateHtml();
 }
 
+/** "Hermes suggested an AI routine for this day" with a Use it button (when saved but not applied). */
+function renderAIBanner() {
+  const box = $("#ai-banner"), p = V(), a = p.strategies && p.strategies["AI routine"];
+  if (!box) return;
+  box.hidden = !(a && p.chosen !== "AI routine");
+  if (box.hidden) return;
+  const cur = p.strategies["Current routine"], opt = p.strategies["Optimised"];
+  box.innerHTML = '<div class="ai-head">' + AI_ICON + "<b>Hermes suggested an AI routine for " + (p.for_date === isoDate(new Date()) ? "today" : fmtDate(dateOf(p.for_date))) + "</b></div>" +
+    '<p class="sub">' + esc(a.reason || "") + "</p>" + strip(tidy(a.values)) +
+    '<div class="ai-facts"><span>Score <b>' + pts(scoreOf(a.total, cur.total)) + "</b>" + (opt ? " (Optimised " + pts(scoreOf(opt.total, cur.total)) + ")" : "") + "</span><span>Electricity <b>" + gbp(a.grid_cost) + "</b></span><span>" + esc(comfortText(a)) + "</span></div>" +
+    '<div class="btn-row end"><span class="msg" id="ai-msg"></span><button type="button" class="btn ghost" id="ai-edit">Open in editor</button><button type="button" class="btn primary ai-btn" id="ai-use">Use the AI routine</button></div>';
+  $("#ai-edit").onclick = () => { setEdit(a.values.slice(), a.offsets ? a.offsets.slice() : null); if (MOBILE()) setTab("plan"); else $("#edit").scrollIntoView(); };
+  $("#ai-use").onclick = async () => {
+    if (!(await confirmDlg("Use Hermes's AI routine?", "<p>This writes it to <code>" + esc(S.cfg.schedule_entity) + "</code> for " + (p.for_date === isoDate(new Date()) ? "today" : WDL[wdIdx(dateOf(p.for_date))]) + ". You can undo it afterwards.</p>" + strip(tidy(a.values)), "Use it"))) return;
+    const m = $("#ai-msg"); m.className = "msg"; m.textContent = "Applying…";
+    try { await api("/api/ai/apply", { date: p.for_date }); await loadAll(); } catch (e) { m.className = "msg err"; m.textContent = e.message; }
+  };
+}
+
 function latestUpdateHtml() {
   const u = (S.chat || []).filter((m) => m.from === "hermes" && m.kind === "update").slice(-1)[0];
   if (!u) return "";
@@ -344,7 +371,8 @@ function renderHero() {
     '<span class="tag">' + ({ home: "Home all day", away_day: "Out " + rng(S.cfg.occupancy.away_from, S.cfg.occupancy.away_to), away_all: "Away all day" }[p.occupancy?.status_tomorrow] || "") + "</span>";
   let title, why = "";
   const money = cur.grid_cost - ch.grid_cost, comfort = cur.penalty - ch.penalty;
-  if (p.kind === "today_tail") { title = "The rest of today"; why = "Tonight's remaining setpoints. Tomorrow's plan is shown on its own day."; }
+  if (p.chosen === "AI routine") { title = "Hermes's AI routine is in force"; why = esc((p.strategies["AI routine"] || {}).reason || (p.manual || {}).reason || "") + " It started from the Optimised plan."; }
+  else if (p.kind === "today_tail") { title = "The rest of today"; why = "Tonight's remaining setpoints. Tomorrow's plan is shown on its own day."; }
   else if (p.chosen === "Current routine") { title = "Your routine is already the best plan"; why = "Nothing beat it by more than 2p, so the planner kept your usual setpoints."; }
   else if (p.chosen === "Your edit" && p.manual && p.manual.by === "hermes") { title = "Hermes adjusted today's plan"; why = esc(p.manual.reason || "") + " "; }
   else if (p.chosen === "Your edit") { title = "Running your edited plan"; why = "Pushed by hand at " + esc((p.manual?.at || "").slice(11, 16)) + ". " + (money >= 0.01 ? "About " + gbp(money) + " less electricity than your routine. " : money <= -0.01 ? "About " + gbp(-money) + " more electricity than your routine. " : "") + "Tonight's 22:00 run plans the next day as normal."; }
@@ -360,7 +388,9 @@ function renderHero() {
     if (comfort > 0.05 && cur.hours_below != null) why += " Your routine would leave the room " + comfortText(cur) + ".";
     else if (comfort > 0.05) why += " Your routine would let the room fall below the comfort floor while you're home.";
   }
-  $("#hero-title").textContent = title;
+  $("#hero-title").innerHTML = (p.chosen === "AI routine" ? AI_ICON + " " : "") + esc(title);
+  $("#plan .hero").classList.toggle("ai-glow", p.chosen === "AI routine");
+  renderAIBanner();
   $("#hero-why").innerHTML = why;
   $("#hero-tiles").innerHTML = [
     tile("Electricity", gbp(ch.grid_cost), "Routine " + gbp(cur.grid_cost) + " · incl. house"),
@@ -654,9 +684,9 @@ function renderEditor() {
     (oOn ? " <b>Water</b> is the leaving-water offset: lower means cooler radiators and a better COP, but slower heating." : "");
   const un = $("#undo");
   const prev = p.manual && p.manual.previous;
-  un.hidden = !(p.chosen === "Your edit" && prev);
+  un.hidden = !((p.chosen === "Your edit" || p.chosen === "AI routine") && prev);
   if (!un.hidden) {
-    un.innerHTML = "<span>" + (p.manual.by === "hermes" ? "Hermes adjusted this day" : p.kind === "outlook" ? "Your edit is pinned to this day" : "You're running your own edit") + ", pushed <b>" + esc((p.manual.at || "").replace("T", " ").slice(5, 16)) + "</b>.</span>" + '<button type="button" class="btn ghost" id="undo-btn">Undo: back to ' + esc(NAMES[prev] || prev) + "</button>";
+    un.innerHTML = "<span>" + (p.chosen === "AI routine" ? "Hermes's AI routine is in force" : p.manual.by === "hermes" ? "Hermes adjusted this day" : p.kind === "outlook" ? "Your edit is pinned to this day" : "You're running your own edit") + ", pushed <b>" + esc((p.manual.at || "").replace("T", " ").slice(5, 16)) + "</b>.</span>" + '<button type="button" class="btn ghost" id="undo-btn">Undo: back to ' + esc(NAMES[prev] || prev) + "</button>";
     $("#undo-btn").onclick = undoEdit;
   }
   const ed = $("#editor");
@@ -774,13 +804,14 @@ function renderStrategies() {
     const r = p.strategies[n], chosen = n === p.chosen, base = n === "Current routine";
     const ex = base ? ["the setpoints from your live schedule"] : explain(r.values, cur.values, r.offsets, cur.offsets);
     const ok = r.hours_below == null ? r.penalty < 0.05 : r.hours_below < 0.25;
-    return '<article class="scard' + (chosen ? " is-chosen" : "") + '"><div class="nm"><i class="sw' + (base ? " dot" : "") + '" style="border-color:' + COLOR[n] + '"></i>' + esc(NAMES[n] || n) + (chosen ? ' <span class="tag chosen">Chosen</span>' : "") + "</div>" +
+    const isAI = n === "AI routine";
+    return '<article class="scard' + (chosen ? " is-chosen" : "") + (isAI ? " ai-glow" : "") + '"><div class="nm">' + (isAI ? AI_ICON : '<i class="sw' + (base ? " dot" : "") + '" style="border-color:' + COLOR[n] + '"></i>') + esc(NAMES[n] || n) + (chosen ? ' <span class="tag chosen">Chosen</span>' : isAI && !r.applied ? ' <span class="tag">suggested</span>' : "") + "</div>" +
       '<div><div class="k-small">Electricity</div><div class="big">' + gbp(r.grid_cost) + "</div>" + (base ? '<span class="d" style="color:var(--muted)">Baseline</span>' : moneyDelta(r.grid_cost, cur.grid_cost)) + "</div>" +
       '<div class="comfort ' + (ok ? "ok" : "low") + '"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' + (ok ? '<path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>' : '<path d="M8 3v6M8 12v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>') + "</svg>" + comfortText(r) + "</div>" +
       (cmp[n] ? sparkline(cmp[n].room, COLOR[n], lo, hi) : "") +
       strip(tidy(r.values), false) +
       '<div class="kv"><span>Pump</span><b>' + r.kwh_hp.toFixed(1) + " kWh</b>" + (offOn() && r.offsets ? "<span>Water offset</span><b>" + offSummary(r.offsets) + "</b>" : "") + "<span>Coldest awake</span><b>" + deg(r.t_min_awake) + "</b><span>Score</span><b>" + pts(scoreOf(r.total, cur.total)) + " pts</b></div>" +
-      '<p class="why">' + (ex.length ? esc(ex.slice(0, 4).join("; ")) : "Same setpoints as your routine.") + "</p>" +
+      '<p class="why">' + (isAI && r.reason ? "<b>Hermes:</b> " + esc(r.reason) : ex.length ? esc(ex.slice(0, 4).join("; ")) : "Same setpoints as your routine.") + "</p>" +
       '<button type="button" class="btn ghost" data-try="' + esc(n) + '">Open in editor</button></article>';
   }).join("");
   document.querySelectorAll("[data-try]").forEach((b) => b.addEventListener("click", () => {
@@ -833,7 +864,7 @@ function renderWeek() {
     return '<button type="button" class="day' + (c.date === S.sel ? " first" : "") + '" data-day="' + c.date + '" aria-label="Open ' + fmtDate(d) + '"><div class="dn">' + WD[wdIdx(d)] + " " + d.getDate() + "<span>" + deg(c.mean, 0) + "</span></div>" +
       '<div class="meta">' + esc(stLabel(c.status)) + (c.first ? ' · <b class="pushed">pushed</b>' : "") + "</div>" +
       '<div class="cost">' + gbp(c.grid) + "<small> electricity</small></div>" + delta +
-      strip(c.blocks, false) + '<div class="meta">' + (c.kwh != null ? Math.round(c.kwh) + " kWh pump · " : "") + comfortText({ hours_below: c.hb, penalty: c.pen }, true).toLowerCase() + (c.edited ? ' · <b class="pushed">your edit</b>' : "") + "</div></button>";
+      strip(c.blocks, false) + '<div class="meta">' + (c.kwh != null ? Math.round(c.kwh) + " kWh pump · " : "") + comfortText({ hours_below: c.hb, penalty: c.pen }, true).toLowerCase() + (c.edited ? ' · <b class="pushed">your edit</b>' : "") + (aiDays()[c.date] ? " " + AI_ICON : "") + "</div></button>";
   }).join("");
   document.querySelectorAll("#week-cards [data-day]").forEach((b) => b.addEventListener("click", async () => {
     await selectDay(b.dataset.day); renderWeek();
@@ -1014,6 +1045,7 @@ function fmtSetting(f, v) {
   if (f.kind === "bins") return Object.entries(v).sort((a, b) => +a[0] - +b[0]).map(([k, c]) => k + ":" + c).join(", ");
   if (f.kind === "days") return v.map((d) => WD[d]).join(", ");
   if (f.kind === "bool") return v ? "on" : "off";
+  if (f.kind === "focus") return ["Max savings", "Lean savings", "Balanced", "Lean comfort", "Max comfort"][v] || String(v);
   return String(v);
 }
 const SRC = { default: "default", custom: "yours", fitted: "fitted from your data", pinned: "pinned" };
@@ -1037,7 +1069,12 @@ function renderSettings() {
     const ev = el.type === "checkbox" || el.tagName === "SELECT" ? "change" : "input";
     el.addEventListener(ev, () => {
       let v = el.type === "checkbox" ? el.checked : el.value;
-      if (f.kind === "num" || f.kind === "int") v = el.value === "" ? "" : +el.value;
+      if (f.kind === "num" || f.kind === "int" || f.kind === "focus") v = el.value === "" ? "" : +el.value;
+      if (f.kind === "focus") {
+        const LV = ["Max savings", "Lean savings", "Balanced", "Lean comfort", "Max comfort"];
+        $("#focus-now").textContent = LV[v]; el.setAttribute("aria-valuetext", LV[v]);
+        el.parentNode.querySelectorAll(".focus-ticks span").forEach((s, i) => s.classList.toggle("on", i === v));
+      }
       markDirty(f, v);
     });
   });
@@ -1068,7 +1105,12 @@ function markDirty(f, v) {
 function settingRow(f) {
   const v = setVal(f), dirty = f.path in SET.dirty || SET.resets.has(f.path), id = "set_" + f.path.replace(/\W/g, "_");
   let input;
-  if (f.kind === "bool") input = '<label class="switch"><input type="checkbox" id="' + id + '" data-set="' + f.path + '"' + (v ? " checked" : "") + '><span aria-hidden="true"></span></label>';
+  if (f.kind === "focus") {
+    const LV = ["Max savings", "Lean savings", "Balanced", "Lean comfort", "Max comfort"], cur = +(v == null ? 2 : v);
+    input = '<div class="focus"><input type="range" min="0" max="4" step="1" id="' + id + '" data-set="' + f.path + '" value="' + cur + '" list="focus-ticks" aria-valuetext="' + LV[cur] + '">' +
+      '<div class="focus-ticks">' + LV.map((l, i) => '<span class="' + (i === cur ? "on" : "") + '">' + l + "</span>").join("") + "</div>" +
+      '<div class="focus-ends"><span>Lowest cost</span><b id="focus-now">' + LV[cur] + "</b><span>Closest to " + deg((findField("comfort.target_c") || {}).value) + "</span></div></div>";
+  } else if (f.kind === "bool") input = '<label class="switch"><input type="checkbox" id="' + id + '" data-set="' + f.path + '"' + (v ? " checked" : "") + '><span aria-hidden="true"></span></label>';
   else if (f.kind === "days") input = '<div class="toggles">' + WD.map((n, i) => '<button type="button" class="tg sm" data-day-set="' + f.path + '" data-d="' + i + '" aria-pressed="' + (v || []).includes(i) + '">' + n + "</button>").join("") + "</div>";
   else if (f.kind === "num" || f.kind === "int") input = '<span class="num-in"><input type="number" id="' + id + '" data-set="' + f.path + '" value="' + esc(v) + '"' + (f.min != null ? ' min="' + f.min + '"' : "") + (f.max != null ? ' max="' + f.max + '"' : "") + (f.step != null ? ' step="' + f.step + '"' : "") + ' inputmode="decimal">' + (f.unit ? "<small>" + esc(f.unit) + "</small>" : "") + "</span>";
   else input = '<input type="text" class="txt-in" id="' + id + '" data-set="' + f.path + '" value="' + esc(typeof v === "string" ? v : fmtSetting(f, v)) + '" spellcheck="false">';

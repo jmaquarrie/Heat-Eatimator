@@ -14,7 +14,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import agent, data, model, planner, revisions, settings
+from . import agent, ai, data, model, planner, revisions, settings
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 CTYPES = {".png": "image/png", ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -527,7 +527,11 @@ def do_day(date_s):
     if not plan:
         return 404, json.dumps({"error": "no plan yet"}), "application/json"
     try:
-        return 200, json.dumps(planner.day_view(data.load_config(), plan, date_s)), "application/json"
+        cfg = data.load_config()
+        v = planner.day_view(cfg, plan, date_s)
+        if v.get("kind") != "plan":
+            ai.inject(cfg, plan, v, date_s)
+        return 200, json.dumps(v), "application/json"
     except (ValueError, StopIteration) as e:
         return 400, json.dumps({"error": str(e) or "no such day"}), "application/json"
 
@@ -663,6 +667,13 @@ class H(BaseHTTPRequestHandler):
                 plan = data.load_json("plan_latest.json", {})
                 if plan.get("outlook"):
                     planner.annotate_outlook(data.load_config(), plan)
+                if plan.get("for_date"):
+                    ai.inject(data.load_config(), plan, plan, plan["for_date"])
+                    ais = ai.load()
+                    for o in plan.get("outlook") or []:
+                        if o.get("date") in ais:
+                            o["ai"] = {"applied": ais[o["date"]].get("applied", False)}
+                    plan["ai_days"] = {k: {"applied": v.get("applied", False)} for k, v in ais.items()}
                 return self.send(200, json.dumps(plan), "application/json")
             if p == "/api/day":
                 from urllib.parse import parse_qs
@@ -695,6 +706,16 @@ class H(BaseHTTPRequestHandler):
             if not plan:
                 return 404, json.dumps({"error": "no plan yet"}), "application/json"
             return 200, json.dumps(agent.state(_ha_or_none(), data.load_config(), plan, live=live_status())), "application/json"
+        if p == "/api/agent/routine":
+            if not plan:
+                return 404, json.dumps({"error": "no plan yet"}), "application/json"
+            cfg = data.load_config()
+            d = (q.get("date") or [ai.allowed_dates()[1]])[0]
+            try:
+                return 200, json.dumps({"base": ai.base(cfg, plan, d), "ai_routine": ai.load().get(d), "allowed_dates": ai.allowed_dates(),
+                                        "limits": {"ai_max_deviation_c": (cfg.get("agent") or {}).get("ai_max_deviation_c", 3.0)}}), "application/json"
+            except (ValueError, StopIteration) as e:
+                return 400, json.dumps({"error": str(e) or "no such day"}), "application/json"
         if p == "/api/agent/inbox":
             since = int((q.get("since") or [agent.status_cursor()])[0] or 0)
             msgs = agent.chat_since(since, "you")
@@ -720,6 +741,25 @@ class H(BaseHTTPRequestHandler):
         if not plan:
             return 404, json.dumps({"error": "no plan yet"}), "application/json"
         try:
+            if p == "/api/agent/routine/evaluate":
+                return 200, json.dumps(ai.evaluate(cfg, plan, body.get("date"), body.get("values"), body.get("offsets"))), "application/json"
+            if p == "/api/agent/routine":
+                res = ai.set_routine(_ha() if body.get("apply") else _ha_or_none(), cfg, plan, body.get("date"), body.get("values"),
+                                     body.get("offsets"), body.get("reason", ""), apply=bool(body.get("apply")))
+                ev, d = res["evaluation"], body.get("date")
+                txt = ("AI routine for %s %s. %s\nScore %s (Optimised %s, your routine 100); electricity £%.2f vs £%.2f; time below comfort %.1f h vs %.1f h." % (
+                    d, "applied" if body.get("apply") else "saved (not applied)", res["routine"]["reason"], ev["summary"]["score"], ev["base"]["score"],
+                    ev["summary"]["electricity"], ev["base"]["electricity"], ev["summary"]["hours_below"], ev["base"]["hours_below"]))
+                res["message"] = agent.chat_add("hermes", txt, kind="update", meta={"ai_routine": d})
+                _log("ai_routine", date=d, applied=bool(body.get("apply")))
+                return 200, json.dumps(res), "application/json"
+            if p == "/api/agent/routine/apply":
+                pushed = ai.apply_routine(_ha(), cfg, plan, body.get("date"))
+                agent.chat_add("hermes", "Applied the AI routine for %s." % body.get("date"), kind="update", meta={"ai_routine": body.get("date")})
+                return 200, json.dumps({"pushed": pushed}), "application/json"
+            if p == "/api/agent/routine/clear":
+                ai.clear(body.get("date"))
+                return 200, json.dumps({"cleared": body.get("date")}), "application/json"
             if p == "/api/agent/project":
                 return 200, json.dumps(agent.project_today(_ha_or_none(), cfg, plan, body.get("values"), body.get("offsets"))), "application/json"
             if p == "/api/agent/suggest":
@@ -763,6 +803,14 @@ class H(BaseHTTPRequestHandler):
                     code, out, _ = start_rerun()
                     res["replan"] = json.loads(out)
                 return self.send(200, json.dumps(res), "application/json")
+            if p == "/api/ai/apply":   # the owner accepts Hermes's suggested AI routine
+                plan = data.load_json("plan_latest.json", None)
+                try:
+                    pushed = ai.apply_routine(_ha(), data.load_config(), plan, body.get("date"))
+                except (ValueError, StopIteration, KeyError) as e:
+                    return self.send(400, json.dumps({"error": str(e) or "can't apply"}), "application/json")
+                _log("ai_routine_applied_by_owner", date=body.get("date"))
+                return self.send(200, json.dumps({"pushed": pushed}), "application/json")
             if p == "/api/chat":
                 text = str(body.get("text", "")).strip()
                 if not text:

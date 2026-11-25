@@ -80,6 +80,42 @@ message.
 6. Don't post when nothing changed, except an optional short evening summary (`kind: "update"`) at 21:30:
    what changed today and how the day went.
 
+## AI routine (today and tomorrow only)
+Hermes can set a daily **AI routine**: its own version of the day, always starting from that day's
+**Optimised** plan. The dashboard marks it with an AI badge and a purple-to-pink border. The owner sees the
+reasoning, and can apply it or undo it.
+
+| Method | Path | What it does |
+|---|---|---|
+| GET | `/api/agent/routine?date=YYYY-MM-DD` | The Optimised base for that day (values, offsets, score, electricity, comfort), your routine's numbers, any AI routine already saved, which dates are allowed, and the deviation limit. Default date: tomorrow. |
+| POST | `/api/agent/routine/evaluate` | `{"date", "values":[7], "offsets":[7]}`: score a candidate (routine = 100) against the Optimised base. Read-only; call it as often as you like. |
+| POST | `/api/agent/routine` | `{"date", "values", "offsets", "reason", "apply": true\|false}`: save the AI routine, with a reason of a sentence or two. `apply: true` also writes it to the helper. Posts an update card to the chat. |
+| POST | `/api/agent/routine/apply` | `{"date"}`: apply a saved AI routine. |
+| POST | `/api/agent/routine/clear` | `{"date"}`: delete it. This doesn't undo an applied one; the owner's Undo does that. |
+
+Rules, enforced by the planner:
+- Only today or tomorrow.
+- Every block within `agent.ai_max_deviation_c` (default **3 °C**) of the Optimised plan.
+- Blocks of today that have ended can't change.
+- A reason is required.
+
+Applying to tomorrow before 22:00 writes that weekday now, and the 22:00 run keeps the AI routine instead of
+re-optimising (a hand edit the owner pinned still wins).
+
+How to build one:
+1. `GET /api/agent/routine?date=<tomorrow>`.
+2. Start from `base.values` / `base.offsets`. Adjust for what the planner can't know:
+   - the owner's chat messages ("guests tonight", "out until 6"),
+   - their calendar, if Hermes can read it,
+   - a weather forecast that disagrees with Open-Meteo,
+   - how today's measured room temperature compared with the prediction (e.g. the house lags, so raise
+     the water offset before the evening).
+3. Evaluate two or three variants. Prefer one that keeps `score` at or above the base, unless the reason is
+   comfort the owner asked for.
+4. Save it with a plain-English reason. Apply it only if the owner has said Hermes may (a standing
+   instruction in chat), otherwise leave it as a suggestion. The dashboard shows a **Use the AI routine**
+   button.
+
 ## Getting chat messages to Hermes promptly
 - **Polling:** `GET /api/agent/inbox` every 1–2 minutes while the owner is likely to be around. Cheap; no
   HA or Daikin calls.

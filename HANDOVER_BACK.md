@@ -213,6 +213,17 @@ old code).
 - New data file `settings_log.json` (safe to delete). `schedule_entity` and `live_schedule_id` are deliberately
   not editable.
 
+## Update 25 Nov (later): cost/comfort slider and AI routine
+- `comfort.focus` (0–4, default 2): `model.FOCUS_LEVELS` scales comfort penalties (×0.25…×4) and shifts the
+  daytime comfort line (−0.5…+0.5 °C, capped at the target). Shown as a slider at the top of Settings.
+- `heatplanner/ai.py`: the AI routine (today or tomorrow, based on Optimised), stored in `ai_routines.json`.
+  `build_plan()` keeps an applied one for its day (a pinned hand edit wins). Agent endpoints are under
+  `/api/agent/routine*` (see HERMES_AGENT.md). The owner applies a suggestion with `POST /api/ai/apply`
+  (write key).
+- `push_values(..., name=)` lets the chosen strategy be "AI routine". Undo works the same as for hand edits.
+- The Hermes limits' defaults moved into `model.DEFAULT_CONFIG["agent"]`, so the Settings page shows them.
+  `agent.ai_max_deviation_c` defaults to 3 °C.
+
 ## 4. What the owner still has to do in HA
 1. Review and paste `deploy/ha/planner_to_thermostat.yaml` (setpoint → `climate.altherma_room_temperature`).
 2. Review and paste `deploy/ha/planner_offset_to_daikin.yaml` (lwt_offset → `climate.altherma_leaving_water_offset`).

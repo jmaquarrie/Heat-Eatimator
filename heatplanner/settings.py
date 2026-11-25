@@ -15,6 +15,9 @@ WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 #       | times (HH:MM list) | bins (outdoor-temperature -> COP map) | entity
 # path "params.<key>" = model parameter (fitted daily; setting it pins it)
 SECTIONS = [
+    {"id": "focus", "title": "Cost or comfort", "intro": "How much the planner will give up comfort to save money.", "fields": [
+        ("comfort.focus", "focus", "Planner focus", "", 0, 4, 1, "Savings levels let the room drift further below your comfort temperature to cut cost. Comfort levels keep it closer to your comfortable temperature even when that costs more."),
+    ]},
     {"id": "comfort", "title": "Comfort", "intro": "What counts as warm enough, and how hard the planner works to stay there.", "fields": [
         ("comfort.target_c", "num", "Comfortable temperature", "°C", 17, 23, 0.5, "Used by the Steady strategy and as your everyday target."),
         ("comfort.soft_floor_c", "num", "Comfort floor", "°C", 15, 22, 0.1, "Below this while you're home and awake counts as \"below comfort\"."),
@@ -90,6 +93,7 @@ SECTIONS = [
         ("agent.min_minutes_between", "int", "Minimum gap between adjustments", "min", 0, 240, 5, ""),
         ("agent.max_setpoint_change_c", "num", "Largest change per block", "°C", 0, 5, 0.5, ""),
         ("agent.checkin_times", "times", "Wake Hermes at", "", None, None, None, "e.g. 07:00, 12:30, 16:30 (needs the webhook below)."),
+        ("agent.ai_max_deviation_c", "num", "AI routine: largest difference from Optimised", "°C", 0, 6, 0.5, "How far Hermes's AI routine may move any block from the Optimised plan."),
         ("agent.webhook_url", "text", "Hermes webhook URL", "", None, None, None, "Optional. The planner POSTs chat messages and check-ins here."),
     ]},
     {"id": "entities", "title": "Home Assistant entities", "intro": "Which sensors the planner reads. The schedules it writes to can't be changed here.", "fields": [
@@ -170,6 +174,14 @@ def parse(path, raw):
     if not f:
         raise ValueError("unknown setting %s" % path)
     _, kind, label, unit, lo, hi, step, _ = f
+    if kind == "focus":
+        try:
+            v = int(round(float(raw)))
+        except (TypeError, ValueError):
+            raise ValueError("%s: pick a level" % label)
+        if not 0 <= v <= 4:
+            raise ValueError("%s: pick a level from 0 to 4" % label)
+        return v
     if kind in ("num", "int"):
         try:
             v = float(raw)

@@ -72,6 +72,7 @@ DEFAULT_CONFIG = {
         "sleep_floor_c": 17.5,
         "away_floor_c": 16.0,
         "end_of_day_c": 19.5,      # heat left below this at the end of the window is charged for
+        "focus": 2,                # cost <-> comfort slider: 0 Max savings .. 2 Balanced .. 4 Max comfort
         "soft_penalty_gbp_per_kh": 0.15,
         "hard_penalty_gbp_per_kh": 0.60,
         "max_setpoint_c": 22.0,
@@ -98,6 +99,9 @@ DEFAULT_CONFIG = {
     # Plan the leaving-water offset alongside the room setpoint. The planner only writes it into the helper
     # (block data "lwt_offset"); an HA automation applies it. Range is also clipped to the entity's own min/max.
     "lwt_offset": {"enabled": True, "min": -5, "max": 5, "step": 1, "write_cost_gbp": 0.01},
+    # limits on what Hermes may change on its own (see agent.py / ai.py)
+    "agent": {"max_adjustments_per_day": 8, "min_minutes_between": 20, "max_setpoint_change_c": 2.0,
+              "ai_max_deviation_c": 3.0, "webhook_url": "", "checkin_times": []},
     "publish_sensors": True,   # write sensor.heatplanner_* states into HA after each plan (read-only for HA, safe to disable)
 }
 
@@ -199,17 +203,35 @@ def comfort_class(cfg, date, hour):
     return "home"
 
 
+# Cost <-> comfort focus (Settings slider). Each level scales how much being cold counts, and moves the daytime
+# comfort lines so "comfort" levels keep you closer to your comfortable temperature. 2 = Balanced (as before).
+FOCUS_LEVELS = [
+    {"name": "Max savings", "mult": 0.25, "shift": -0.5},
+    {"name": "Lean savings", "mult": 0.5, "shift": -0.25},
+    {"name": "Balanced", "mult": 1.0, "shift": 0.0},
+    {"name": "Lean comfort", "mult": 2.0, "shift": 0.25},
+    {"name": "Max comfort", "mult": 4.0, "shift": 0.5},
+]
+
+
+def focus_level(cfg):
+    i = int(round(cfg["comfort"].get("focus", 2)))
+    return FOCUS_LEVELS[max(0, min(len(FOCUS_LEVELS) - 1, i))]
+
+
 def comfort_penalty(cfg, cls, temp, dt):
     c = cfg["comfort"]
+    f = focus_level(cfg)
     if cls == "sleep":
         d = max(0.0, c["sleep_floor_c"] - temp)
-        return c["hard_penalty_gbp_per_kh"] * d * dt
+        return f["mult"] * c["hard_penalty_gbp_per_kh"] * d * dt
     if cls == "away":
         d = max(0.0, c["away_floor_c"] - temp)
-        return c["hard_penalty_gbp_per_kh"] * d * dt
-    soft = max(0.0, c["soft_floor_c"] - temp)
-    hard = max(0.0, c["hard_floor_c"] - temp)
-    return (c["soft_penalty_gbp_per_kh"] * soft + c["hard_penalty_gbp_per_kh"] * hard) * dt
+        return f["mult"] * c["hard_penalty_gbp_per_kh"] * d * dt
+    soft_line = min(c["target_c"], c["soft_floor_c"] + f["shift"]) if f["shift"] > 0 else c["soft_floor_c"] + f["shift"]
+    soft = max(0.0, soft_line - temp)
+    hard = max(0.0, c["hard_floor_c"] + min(0.0, f["shift"]) - temp)
+    return f["mult"] * (c["soft_penalty_gbp_per_kh"] * soft + c["hard_penalty_gbp_per_kh"] * hard) * dt
 
 
 # ------------------------------------------------------------------ simulation

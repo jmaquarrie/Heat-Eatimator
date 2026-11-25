@@ -14,7 +14,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import agent, data, model, planner, revisions
+from . import agent, data, model, planner, revisions, settings
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 CTYPES = {".png": "image/png", ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -648,6 +648,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send(200, json.dumps(public_config()), "application/json")
             if p == "/api/log":
                 return self.send(200, json.dumps(recent_log()), "application/json")
+            if p == "/api/settings":
+                return self.send(200, json.dumps(settings.get_settings()), "application/json")
             if p == "/api/revisions":
                 from urllib.parse import parse_qs
                 return self.send(200, json.dumps(revisions.for_date((parse_qs(u.query).get("date") or [dt.date.today().isoformat()])[0])), "application/json")
@@ -744,8 +746,23 @@ class H(BaseHTTPRequestHandler):
                 return self.send(*do_simulate(body))
             if p.startswith("/api/agent/"):
                 return self.send(*self.agent_post(p, body))
+            if p == "/api/settings/preview":   # read-only: re-score the plan under proposed settings
+                try:
+                    return self.send(200, json.dumps(settings.preview(body.get("changes"), body.get("resets") or [])), "application/json")
+                except (ValueError, KeyError) as e:
+                    return self.send(400, json.dumps({"error": str(e)}), "application/json")
             if WRITE_KEY and self.headers.get("X-Planner-Key", "") != WRITE_KEY:
                 return self.send(403, json.dumps({"error": "write key required", "need_key": True}), "application/json")
+            if p == "/api/settings":
+                try:
+                    res = settings.save(body.get("changes"), body.get("resets") or [])
+                except ValueError as e:
+                    return self.send(400, json.dumps({"error": str(e)}), "application/json")
+                _log("settings_saved", changes=list((body.get("changes") or {}).keys()), reset=body.get("resets") or [])
+                if body.get("replan") or res["needs_replan"]:
+                    code, out, _ = start_rerun()
+                    res["replan"] = json.loads(out)
+                return self.send(200, json.dumps(res), "application/json")
             if p == "/api/chat":
                 text = str(body.get("text", "")).strip()
                 if not text:

@@ -115,7 +115,7 @@ def live_ctx(ha, cfg, plan, room=None, soc_kwh=None):
             predicted_now = r["room"]
     ctx = {"start_dt": start, "hours": (end - start).total_seconds() / 3600,
            "t_room0": room if room is not None else (predicted_now or 19.5),
-           "soc0_kwh": max(cfg["battery"]["reserve_kwh"], soc_kwh), "tomorrow": tomorrow, "terminal_ref_c": 19.5,
+           "soc0_kwh": max(cfg["battery"]["reserve_kwh"], soc_kwh), "tomorrow": tomorrow, "terminal_ref_c": cfg["comfort"].get("end_of_day_c", 19.5),
            "outdoor": data.series_fn(wx, "t", params.get("outdoor_bias_c", 0.0)), "radiation": data.series_fn(wx, "rad")}
     return ctx, params, room, predicted_now
 
@@ -149,7 +149,7 @@ def suggest_today(ha, cfg, plan, passes=3):
     ctx, params, room, pred = live_ctx(ha, cfg, plan)
     today = ctx["start_dt"].date()
     locked = planner.ended_blocks(cfg, today, ctx["start_dt"])
-    cands = cfg["optimiser"]["candidates"]
+    cands = model.setpoint_candidates(cfg)
     lo, hi = (plan.get("lwt_offset") or {}).get("min", -5), (plan.get("lwt_offset") or {}).get("max", 5)
     ocands = model.offset_candidates(cfg, lo, hi) if to is not None else []
 

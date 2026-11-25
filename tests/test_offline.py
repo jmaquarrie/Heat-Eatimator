@@ -245,6 +245,37 @@ class Offline(unittest.TestCase):
         self.assertIn("score", idx[-1])
         self.assertGreaterEqual(idx[-1]["score"], 100)                  # the chosen plan never scores below the routine
 
+    def test_settings_validate_pin_save_preview(self):
+        from heatplanner import settings
+        st = settings.get_settings()
+        paths = [f["path"] for sec in st["sections"] for f in sec["fields"]]
+        self.assertGreater(len(paths), 60)
+        self.assertNotIn("schedule_entity", paths)                       # the helpers it writes to can't be changed
+        with self.assertRaises(ValueError):
+            settings.parse("comfort.min_setpoint_c", 30)
+        with self.assertRaises(ValueError):
+            settings.parse("blocks", "0,4,3,24")
+        self.assertEqual(settings.parse("tariff.cosy", "4-7, 13-16"), [[4.0, 7.0], [13.0, 16.0]])
+        self.assertEqual(settings.parse("blocks", "0,6,12,18,24"), [[0, 6], [6, 12], [12, 18], [18, 24]])
+        self.assertEqual(settings.parse("occupancy.away_weekdays", "Mon, Wed"), [0, 2])
+        with self.assertRaises(ValueError):                              # cross-field check
+            settings.build({"comfort.hard_floor_c": 21, "comfort.soft_floor_c": 20})
+        before = data.load_json("config.json", {})
+        try:
+            pv = settings.preview({"comfort.soft_penalty_gbp_per_kh": 0.5})
+            self.assertIn("replanned", pv["after"])
+            self.assertEqual(data.load_json("config.json", {}), before)  # preview saves nothing
+            settings.save({"params.ua_kw_per_k": 0.31, "optimiser.min_gain_points": 1.5})
+            self.assertEqual(data.load_params()["ua_kw_per_k"], 0.31)  # pinned over the fitted value
+            self.assertEqual(data.load_config()["optimiser"]["min_gain_points"], 1.5)
+            v, d, src = settings.current("params.ua_kw_per_k")
+            self.assertEqual(src, "pinned")
+            settings.save({}, ["params.ua_kw_per_k", "optimiser.min_gain_points"])
+            self.assertNotEqual(data.load_params()["ua_kw_per_k"], 0.31)
+            self.assertTrue(data.load_json("settings_log.json", []))
+        finally:
+            data.save_json("config.json", before)
+
     def test_chat_channel(self):
         from heatplanner import agent
         m1 = agent.chat_add("you", "Can you warm the snug for 7pm?")

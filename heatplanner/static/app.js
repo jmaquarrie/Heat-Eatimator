@@ -885,9 +885,9 @@ function wireOcc() {
     rerun("/api/occupancy", { away_weekdays: S.occ.aw.slice().sort(), away_from: +$("#occ-from").value, away_to: +$("#occ-to").value, overrides: ov }, $("#occ-msg"));
   };
 }
-async function rerun(path, body, m) {
+async function rerun(path, body, m, started) {
   m.className = "msg"; m.textContent = path === "/api/occupancy" ? "Saving…" : "Starting…";
-  try { await api(path, body); } catch (e) { m.className = "msg err"; m.textContent = e.message; return; }
+  if (!started) { try { await api(path, body); } catch (e) { m.className = "msg err"; m.textContent = e.message; return; } }
   m.textContent = "Re-running the model (about a minute)…";
   for (let i = 0; i < 160; i++) {
     await new Promise((z) => setTimeout(z, 1500));
@@ -1004,6 +1004,131 @@ function renderHistory() {
   }).join("");
 }
 
+/* ---------------------------------------------------------------- settings */
+const SET = { data: null, dirty: {}, resets: new Set() };
+function fmtSetting(f, v) {
+  if (v == null) return "";
+  if (f.kind === "hours") return v.map(([a, b]) => a + "-" + b).join(", ");
+  if (f.kind === "bounds") return [v[0][0]].concat(v.map((r) => r[1])).join(", ");
+  if (f.kind === "times") return v.join(", ");
+  if (f.kind === "bins") return Object.entries(v).sort((a, b) => +a[0] - +b[0]).map(([k, c]) => k + ":" + c).join(", ");
+  if (f.kind === "days") return v.map((d) => WD[d]).join(", ");
+  if (f.kind === "bool") return v ? "on" : "off";
+  return String(v);
+}
+const SRC = { default: "default", custom: "yours", fitted: "fitted from your data", pinned: "pinned" };
+async function loadSettings() {
+  try { SET.data = await api("/api/settings"); } catch (e) { $("#set-body").innerHTML = '<p class="foot">Couldn\'t load settings: ' + esc(e.message) + "</p>"; return; }
+  renderSettings();
+}
+function setVal(f) { return f.path in SET.dirty ? SET.dirty[f.path] : SET.resets.has(f.path) ? f.default : f.value; }
+function renderSettings() {
+  if (!SET.data) return;
+  const q = ($("#set-find").value || "").toLowerCase().trim();
+  $("#set-jump").innerHTML = SET.data.sections.map((s) => '<a href="#set-' + s.id + '">' + esc(s.title) + "</a>").join("");
+  $("#set-body").innerHTML = SET.data.sections.map((s) => {
+    const fields = s.fields.filter((f) => !q || (f.label + " " + f.help + " " + f.path + " " + s.title).toLowerCase().includes(q));
+    if (!fields.length) return "";
+    return '<div class="card set-sec" id="set-' + s.id + '"><div class="card-head"><div><h2>' + esc(s.title) + '</h2><p class="sub">' + esc(s.intro) + "</p></div></div>" +
+      fields.map((f) => settingRow(f)).join("") + "</div>";
+  }).join("") || '<p class="foot">No setting matches “' + esc(q) + "”.</p>";
+  $("#set-body").querySelectorAll("[data-set]").forEach((el) => {
+    const f = findField(el.dataset.set);
+    const ev = el.type === "checkbox" || el.tagName === "SELECT" ? "change" : "input";
+    el.addEventListener(ev, () => {
+      let v = el.type === "checkbox" ? el.checked : el.value;
+      if (f.kind === "num" || f.kind === "int") v = el.value === "" ? "" : +el.value;
+      markDirty(f, v);
+    });
+  });
+  $("#set-body").querySelectorAll("[data-day-set]").forEach((b) => b.addEventListener("click", () => {
+    const f = findField(b.dataset.daySet), cur = (setVal(f) || []).slice(), d = +b.dataset.d;
+    markDirty(f, cur.includes(d) ? cur.filter((x) => x !== d) : cur.concat(d).sort());
+    renderSettings();
+  }));
+  $("#set-body").querySelectorAll("[data-reset]").forEach((b) => b.addEventListener("click", () => {
+    const f = findField(b.dataset.reset);
+    delete SET.dirty[f.path];
+    if (f.source === "custom" || f.source === "pinned") SET.resets.add(f.path);
+    renderSettings(); updateSetBar();
+  }));
+  $("#set-log").innerHTML = (SET.data.log || []).slice().reverse().map((l) => "<li>" + esc(l.at.replace("T", " ").slice(0, 16)) + " <b>" + esc(l.by) + "</b> " +
+    esc(Object.entries(l.changes || {}).map(([k, v]) => (findField(k) ? findField(k).label : k) + " = " + (typeof v === "object" ? JSON.stringify(v) : v)).concat((l.reset || []).map((k) => "reset " + (findField(k) ? findField(k).label : k))).join("; ")) + "</li>").join("") || "<li>No changes yet.</li>";
+  updateSetBar();
+}
+function findField(path) { for (const s of SET.data.sections) for (const f of s.fields) if (f.path === path) return f; return null; }
+function markDirty(f, v) {
+  SET.resets.delete(f.path);
+  if (JSON.stringify(v) === JSON.stringify(f.value) || (typeof v === "string" && v === fmtSetting(f, f.value))) delete SET.dirty[f.path];
+  else SET.dirty[f.path] = v;
+  const row = document.querySelector('[data-row="' + CSS.escape(f.path) + '"]');
+  if (row) row.classList.toggle("dirty", f.path in SET.dirty);
+  updateSetBar();
+}
+function settingRow(f) {
+  const v = setVal(f), dirty = f.path in SET.dirty || SET.resets.has(f.path), id = "set_" + f.path.replace(/\W/g, "_");
+  let input;
+  if (f.kind === "bool") input = '<label class="switch"><input type="checkbox" id="' + id + '" data-set="' + f.path + '"' + (v ? " checked" : "") + '><span aria-hidden="true"></span></label>';
+  else if (f.kind === "days") input = '<div class="toggles">' + WD.map((n, i) => '<button type="button" class="tg sm" data-day-set="' + f.path + '" data-d="' + i + '" aria-pressed="' + (v || []).includes(i) + '">' + n + "</button>").join("") + "</div>";
+  else if (f.kind === "num" || f.kind === "int") input = '<span class="num-in"><input type="number" id="' + id + '" data-set="' + f.path + '" value="' + esc(v) + '"' + (f.min != null ? ' min="' + f.min + '"' : "") + (f.max != null ? ' max="' + f.max + '"' : "") + (f.step != null ? ' step="' + f.step + '"' : "") + ' inputmode="decimal">' + (f.unit ? "<small>" + esc(f.unit) + "</small>" : "") + "</span>";
+  else input = '<input type="text" class="txt-in" id="' + id + '" data-set="' + f.path + '" value="' + esc(typeof v === "string" ? v : fmtSetting(f, v)) + '" spellcheck="false">';
+  const note = f.source === "fitted" ? "fitted · default " + fmtSetting(f, f.default) : f.source === "pinned" ? "pinned · fitted " + fmtSetting(f, f.default) : f.source === "custom" ? "yours · default " + fmtSetting(f, f.default) : "default";
+  const canReset = f.source === "custom" || f.source === "pinned" || f.path in SET.dirty;
+  return '<div class="set-row' + (dirty ? " dirty" : "") + '" data-row="' + esc(f.path) + '"><div class="set-lab"><label for="' + id + '">' + esc(f.label) + "</label>" +
+    (f.help ? "<small>" + esc(f.help) + "</small>" : "") + '</div><div class="set-in">' + input +
+    '<span class="set-src src-' + f.source + '">' + esc(SET.resets.has(f.path) ? "back to " + (f.source === "pinned" ? "fitted" : "default") + " on save" : note) + "</span>" +
+    (canReset ? '<button type="button" class="icon-btn sm" data-reset="' + esc(f.path) + '" title="Reset to ' + (f.source === "pinned" ? "the fitted value" : "default") + '" aria-label="Reset ' + esc(f.label) + '">↺</button>' : "") + "</div></div>";
+}
+function updateSetBar() {
+  const n = Object.keys(SET.dirty).length + SET.resets.size;
+  $("#set-bar").hidden = !n;
+  $("#set-count").textContent = n + (n === 1 ? " change" : " changes");
+}
+function setPayload() { return { changes: SET.dirty, resets: [...SET.resets] }; }
+async function previewSettings() {
+  const m = $("#set-msg"), box = $("#set-impact");
+  m.className = "msg"; m.textContent = "Working it out…";
+  try {
+    const r = await api("/api/settings/preview", setPayload());
+    m.textContent = "";
+    const row = (k, b, a, fmt, better) => { const d = a - b, good = better === "up" ? d > 0 : d < 0;
+      return "<tr><td>" + k + "</td><td class='r'>" + fmt(b) + "</td><td class='r'>" + fmt(a) + "</td><td class='r " + (Math.abs(d) < 1e-9 ? "" : good ? "up-good" : "up-bad") + "'>" + (Math.abs(d) < 1e-9 ? "–" : (d > 0 ? "+" : "−") + fmt(Math.abs(d)).replace("£", "£")) + "</td></tr>"; };
+    const tbl = (title, b, a) => "<h3>" + title + "</h3><table class='tbl'><thead><tr><th></th><th class='r'>Now</th><th class='r'>With changes</th><th class='r'>Difference</th></tr></thead><tbody>" +
+      row("Score (routine = 100)", b.score, a.score, (x) => (x == null ? "–" : String(Math.round(x))), "up") +
+      row("Electricity", b.electricity, a.electricity, (x) => gbp(x), "down") +
+      row("Time below comfort", b.hours_below, a.hours_below, (x) => (Math.round(x * 4) / 4) + " h", "down") +
+      row("Pump electricity", b.kwh, a.kwh, (x) => x.toFixed(1) + " kWh", "down") +
+      row("Coldest while awake", b.coldest, a.coldest, (x) => x.toFixed(1) + "°", "up") + "</tbody></table>";
+    box.hidden = false;
+    box.innerHTML = '<div class="card-head"><div><h2>Impact on ' + fmtDate(dateOf(r.for_date)) + '</h2><p class="sub">Uses the forecast stored with the latest plan. Nothing is saved yet.</p></div></div>' +
+      tbl("The plan in force, re-scored", r.before.plan, r.after.plan) +
+      tbl("What the planner would choose", r.before.replanned, r.after.replanned) +
+      '<div class="set-strips"><div><small>Planner\'s choice now</small>' + strip(r.before.replanned.blocks) + '</div><div><small>With your changes</small>' + strip(r.after.replanned.blocks) + "</div></div>" +
+      '<p class="foot">Each score is against your routine under that column\'s settings. Electricity, hours and temperatures compare directly.' +
+      (offOn() ? " Water offset with your changes: " + esc(offSummary(r.after.replanned.offsets)) + " (now " + esc(offSummary(r.before.replanned.offsets)) + ")." : "") + "</p>";
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (e) { m.className = "msg err"; m.textContent = e.message; }
+}
+async function saveSettings(replan) {
+  const m = $("#set-msg");
+  m.className = "msg"; m.textContent = "Saving…";
+  try {
+    const r = await api("/api/settings", Object.assign(setPayload(), { replan }));
+    SET.dirty = {}; SET.resets = new Set();
+    await loadSettings();
+    if (replan || r.needs_replan) { await rerun("/api/rerun-status-only", null, m, true); }
+    else { m.className = "msg ok"; m.textContent = "Saved. Tonight's 22:00 run uses the new settings."; $("#set-bar").hidden = false; setTimeout(updateSetBar, 2500); }
+  } catch (e) { m.className = "msg err"; m.textContent = e.message; }
+}
+function wireSettings() {
+  $("#set-find").addEventListener("input", renderSettings);
+  $("#set-discard").onclick = () => { SET.dirty = {}; SET.resets = new Set(); $("#set-impact").hidden = true; renderSettings(); };
+  $("#set-preview").onclick = previewSettings;
+  $("#set-save").onclick = () => saveSettings(false);
+  $("#set-save-replan").onclick = () => saveSettings(true);
+  loadSettings();
+}
+
 /* ---------------------------------------------------------------- Hermes chat */
 let chatTimer = null;
 function chatOpen() { return !$("#chat").hidden; }
@@ -1084,7 +1209,7 @@ function wireTabs() {
 }
 let rz = null, wasMobile = MOBILE();
 addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (MOBILE() !== wasMobile) { wasMobile = MOBILE(); setTab(document.body.dataset.tab, false); } else drawCharts(); }, 150); });
-wireTheme(); wireEditor(); wireOcc(); wireTabs(); wireChat();
+wireTheme(); wireEditor(); wireOcc(); wireTabs(); wireChat(); wireSettings();
 loadAll().catch((e) => { $("#loading").textContent = "Could not load the plan: " + e.message; });
 setInterval(loadStatus, 60000);
 setInterval(() => { if (!S.edit && document.visibilityState === "visible" && !$("#dlg").open) loadAll(); }, 300000);

@@ -195,6 +195,24 @@ old code).
 - After a manual or Hermes change, the plan's prediction (`trace_best`) is recomputed, so the chart shows
   the plan in force. `original_blocks_raw` keeps the 22:00 version.
 
+## Update 25 Nov: Settings page
+- `heatplanner/settings.py` holds one schema of about 75 adjustable factors (label, unit, range, help) used by
+  the API, the validation and the page. `GET/POST /api/settings`; `POST /api/settings/preview` (read-only).
+- Model parameters set on the page are **pinned** in `config.json` → `param_overrides`, and
+  `data.load_params()` applies them over the nightly fit. Reset removes the pin.
+- New config keys, all with defaults matching the old behaviour:
+  - `comfort.end_of_day_c` (was a hard-coded 19.5)
+  - `battery.enabled`
+  - `tariff.auto_detect`
+  - `optimiser.setpoint_step`
+  - `optimiser.min_gain_points` (replaces the hard-coded "2p" rule)
+  - `optimiser.passes`
+  - `outlook.start_room_c` / `start_battery_kwh` (were 19.8 / reserve+3)
+  - `param_overrides`
+  - new parameter `terminal_cop` (was 4.0)
+- New data file `settings_log.json` (safe to delete). `schedule_entity` and `live_schedule_id` are deliberately
+  not editable.
+
 ## 4. What the owner still has to do in HA
 1. Review and paste `deploy/ha/planner_to_thermostat.yaml` (setpoint → `climate.altherma_room_temperature`).
 2. Review and paste `deploy/ha/planner_offset_to_daikin.yaml` (lwt_offset → `climate.altherma_leaving_water_offset`).

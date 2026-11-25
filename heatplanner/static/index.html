@@ -25,7 +25,7 @@
       <span>Heat Planner</span>
     </div>
     <nav class="nav" aria-label="Sections">
-      <a href="#now">Now</a><a href="#plan">Plan</a><a href="#edit">Edit</a><a href="#strategies">Compare</a><a href="#week">Week</a><a href="#home">Who's home</a><a href="#model">Model</a><a href="#history">History</a>
+      <a href="#now">Now</a><a href="#plan">Plan</a><a href="#edit">Edit</a><a href="#strategies">Compare</a><a href="#week">Week</a><a href="#home">Who's home</a><a href="#model">Model</a><a href="#history">History</a><a href="#settings">Settings</a>
     </nav>
     <button class="icon-btn" id="theme" type="button" aria-label="Switch light or dark theme" title="Theme">
       <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
@@ -172,6 +172,26 @@
       <summary>Activity log</summary>
       <ol class="log" id="log"></ol>
     </details>
+  </section>
+
+  <section id="settings" class="sec" data-tab="more" hidden>
+    <h2 class="sec-title">Settings</h2>
+    <p class="sub">Every factor the planner uses. Change anything, see what it would do to today's plan with <b>Preview impact</b>, then save. Values marked <i>fitted</i> are learned from your data each night; setting one pins it.</p>
+    <div class="set-tools">
+      <input type="search" id="set-find" placeholder="Find a setting…" aria-label="Find a setting">
+      <nav class="set-jump" id="set-jump" aria-label="Settings sections"></nav>
+    </div>
+    <div id="set-body"></div>
+    <div class="set-bar" id="set-bar" hidden>
+      <span id="set-count"></span>
+      <span class="msg" id="set-msg" aria-live="polite"></span>
+      <button type="button" class="btn ghost" id="set-discard">Discard</button>
+      <button type="button" class="btn ghost" id="set-preview">Preview impact</button>
+      <button type="button" class="btn ghost" id="set-save">Save</button>
+      <button type="button" class="btn primary" id="set-save-replan">Save and re-plan</button>
+    </div>
+    <div class="card" id="set-impact" hidden></div>
+    <details class="card fold"><summary>Settings history</summary><ol class="log" id="set-log"></ol></details>
     <p class="foot center">Runs at 22:00 (collect, forecast, optimise, push) and re-fits at 03:30. Writes only to <code id="foot-entity"></code>. <a href="/classic">Classic view</a></p>
   </section>
 </main>

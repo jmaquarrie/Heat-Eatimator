@@ -25,6 +25,7 @@ DEFAULT_PARAMS = {
     # control the pump holds LWT = curve(outdoor) + offset while it runs.
     "lwc_a": 36.4,               # weather curve LWT at 0 C outdoor (assumption until fitted from LWT history)
     "lwc_b": -0.55,              # curve slope, K of LWT per K outdoor (assumption until fitted)
+    "terminal_cop": 4.0,         # COP used to value heat left in the house at the end of the window
     "k_emit_kw_per_k": 1.0,      # radiator output per K of (mean water - room); 1.0 reproduces the observed 04:00-15:00 warm-up (refit daily)
 }
 
@@ -57,10 +58,11 @@ DEFAULT_CONFIG = {
         "cosy": [[4, 7], [13, 16], [22, 24]],
         "peak": [[16, 19]],
         "rate_cosy": 0.140651, "rate_standard": 0.286808, "rate_peak": 0.430212,
+        "auto_detect": True,   # re-read the three rates from the Octopus rate history after each data run
     },
     # Anker Solix, managed in the Anker app (not HA): 2.5 kW each way. discharge_limit_entity (W) can be set
     # to re-read a live limit at plan time; left empty because the HA battery helpers are not in use.
-    "battery": {"capacity_kwh": 10.0, "reserve_kwh": 1.0, "max_kw": 2.5, "max_charge_kw": 2.5, "max_discharge_kw": 2.5,
+    "battery": {"enabled": True, "capacity_kwh": 10.0, "reserve_kwh": 1.0, "max_kw": 2.5, "max_charge_kw": 2.5, "max_discharge_kw": 2.5,
                 "rte": 0.90, "discharge_limit_entity": ""},
     "house_load_kw": 0.25,
     "comfort": {
@@ -69,6 +71,7 @@ DEFAULT_CONFIG = {
         "hard_floor_c": 19.0,      # heavy penalty below this while occupied and awake
         "sleep_floor_c": 17.5,
         "away_floor_c": 16.0,
+        "end_of_day_c": 19.5,      # heat left below this at the end of the window is charged for
         "soft_penalty_gbp_per_kh": 0.15,
         "hard_penalty_gbp_per_kh": 0.60,
         "max_setpoint_c": 22.0,
@@ -83,7 +86,13 @@ DEFAULT_CONFIG = {
     # extra room temperatures shown on the dashboard (the thermostat room runs much warmer than the rest)
     "other_rooms": {"Hallway": "sensor.hallway_motion_hallway_temperature", "Landing": "sensor.landing_motion_upstairs_temperature"},
     "fire": {"weekdays": [5, 6], "from": 18.0, "to": 23.0, "extra_gain_kw": 1.0},
-    "optimiser": {"candidates": [x / 2 for x in range(32, 45)]},  # 16.0 .. 22.0 step 0.5
+    # setpoints tried run from comfort.min_setpoint_c to max_setpoint_c in setpoint_step; the planner only moves
+    # away from your routine if the optimised plan scores at least min_gain_points better (routine = 100)
+    "optimiser": {"setpoint_step": 0.5, "min_gain_points": 0.5, "passes": 4},
+    # week-ahead previews start each day at 22:00 the night before from these assumed values
+    "outlook": {"start_room_c": 19.8, "start_battery_kwh": 4.0},
+    # pinned model parameters (Settings page): these replace the daily fitted values
+    "param_overrides": {},
     "blocks": [[0, 4], [4, 7], [7, 13], [13, 16], [16, 19], [19, 22], [22, 24]],
     "push_hour": 22,
     # Plan the leaving-water offset alongside the room setpoint. The planner only writes it into the helper
@@ -226,6 +235,7 @@ def simulate(cfg, params, plan, ctx, use_battery=True, trace=False):
     steps = int(round(ctx["hours"] / DT))
     t_room = ctx["t_room0"]
     bat = cfg["battery"]
+    use_battery = use_battery and bat.get("enabled", True)
     soc = ctx["soc0_kwh"] if use_battery else 0.0
     soc_start = soc
     eta = math.sqrt(bat["rte"])
@@ -310,7 +320,7 @@ def simulate(cfg, params, plan, ctx, use_battery=True, trace=False):
                          "off": off, "lwt": None if lwt is None else round(lwt, 1)})
     # terminal value: leftover battery energy and thermal state, valued at the cosy price
     batt_value = (soc - soc_start) * cosy_rate / eta if use_battery else 0.0
-    cop_ref = 4.0
+    cop_ref = params.get("terminal_cop", 4.0) or 4.0
     ref = ctx.get("terminal_ref_c", 19.5)
     # charge for ending the window colder than ref (that heat must be bought back), but give no credit for
     # ending warmer: a fixed-COP credit made "overheat at 22:00-24:00" look profitable once real COP beat it
@@ -343,6 +353,17 @@ def evaluate(cfg, params, ctx, fixed, values, use_battery=True, trace=False, off
     return simulate(cfg, params, plan, ctx, use_battery, trace)
 
 
+def setpoint_candidates(cfg):
+    c, st = cfg["comfort"], cfg.get("optimiser", {}).get("setpoint_step", 0.5) or 0.5
+    if cfg.get("optimiser", {}).get("candidates"):        # legacy explicit list
+        return [v for v in cfg["optimiser"]["candidates"] if c["min_setpoint_c"] <= v <= c["max_setpoint_c"]]
+    out, v = [], c["min_setpoint_c"]
+    while v <= c["max_setpoint_c"] + 1e-9:
+        out.append(round(v, 2))
+        v += st
+    return out
+
+
 def offset_candidates(cfg, lo=None, hi=None):
     o = cfg.get("lwt_offset", {})
     a, b, st = o.get("min", -5), o.get("max", 5), o.get("step", 1) or 1
@@ -366,7 +387,7 @@ def optimise(cfg, params, ctx, fixed, starts, use_battery=True, passes=4, offset
     "stick" to the last value wherever the offset barely matters): it also starts from several uniform offsets,
     and besides single-block moves it tries moving a whole run of consecutive blocks at once, which costs one
     write instead of two and so isn't blocked by the write price."""
-    cands = cfg["optimiser"]["candidates"]
+    cands = setpoint_candidates(cfg)
     ocands = offset_cands if offset_cands is not None else offset_candidates(cfg)
     n = len(cfg["blocks"])
     ev = lambda v, o: evaluate(cfg, params, ctx, fixed, v, use_battery, offsets=o, fixed_off=fixed_off)["total"]

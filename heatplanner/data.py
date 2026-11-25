@@ -37,7 +37,9 @@ def load_config():
 
 
 def load_params():
-    return model.deep_merge(model.DEFAULT_PARAMS, load_json("params.json", {}).get("params", {}))
+    """Fitted parameters, with any values pinned on the Settings page (config param_overrides) on top."""
+    p = model.deep_merge(model.DEFAULT_PARAMS, load_json("params.json", {}).get("params", {}))
+    return model.deep_merge(p, load_config().get("param_overrides") or {})
 
 
 # ------------------------------------------------------------------ HA history -> 30 min grid

@@ -17,6 +17,8 @@ def log(event, **kw):
 
 def autodetect_tariff(cfg):
     from collections import Counter
+    if not cfg["tariff"].get("auto_detect", True):
+        return cfg
     rows = data.load_rows()[-1000:]
     cl = {"rate_cosy": Counter(), "rate_standard": Counter(), "rate_peak": Counter()}
     for r in rows:

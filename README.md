@@ -54,6 +54,23 @@ Add its entities to `/opt/heatplanner/data/config.json`:
 into Cosy, Standard and Peak, with its cost at your rates. `grid_power` (W, positive = importing)
 appears as a live chip.
 
+### Settings
+The **Settings** page (desktop nav, or More on phones) exposes about 75 factors in groups:
+- comfort floors and how much being cold "costs";
+- your day: sleep, out-of-the-house hours, log fire, house load;
+- tariff prices and windows, and automatic price detection;
+- battery;
+- water offset range and the weather curve;
+- house and heat pump physics: heat loss, thermal mass, free and solar gains, capacity, COP;
+- planner behaviour: when to change your routine, search effort, time blocks, week-ahead assumptions;
+- Hermes limits;
+- Home Assistant entity ids.
+
+Model parameters are refitted nightly. Setting one **pins** it (stored in `config.json` as `param_overrides`),
+and the reset button returns it to the fitted value. **Preview impact** re-scores the current plan and
+re-optimises the day under the proposed settings, before you save. Saves are logged (`settings_log.json`).
+The schedules the planner writes to can't be changed here.
+
 ### Score (points) vs money
 Every plan gets a **score in points, with your routine = 100**:
 `100 + 100 × (routine total − plan total) ÷ routine total`, where the total is electricity plus a price on
@@ -107,6 +124,8 @@ profitable.
 | GET | `/api/actuals?date=YYYY-MM-DD` | measured hourly room / kWh beside that day's prediction (default yesterday) |
 | POST | `/api/simulate` `{"date", "values":[7 setpoints], "offsets":[7]}` | what-if for any editable day, read-only |
 | POST | `/api/push` `{"date", "values", "offsets"}` | writes that day's weekday in `schedule.heat_pump_planner` only (week-ahead days are also pinned in `data/day_overrides.json`) |
+| GET/POST | `/api/settings` | all settings with source (default/yours/fitted/pinned); POST `{changes, resets, replan}` saves |
+| POST | `/api/settings/preview` | re-score and re-optimise the latest plan under proposed settings; read-only |
 | GET/POST | `/api/chat` | dashboard chat with Hermes |
 | GET | `/api/revisions?date=` | changes made to a day (who, when, why, before/after) |
 | * | `/api/agent/*` | Hermes's API, keyed with `HEATPLANNER_AGENT_KEY`: see HERMES_AGENT.md |

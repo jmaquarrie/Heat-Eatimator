@@ -151,7 +151,7 @@ def make_ctx(ha, cfg, params, now=None, wx=None, room=None, soc=None):
             soc_pct = 50.0
         soc = soc_pct / 100 * cfg["battery"]["capacity_kwh"]
     ctx = {"start_dt": start, "hours": hours, "t_room0": room, "soc0_kwh": max(cfg["battery"]["reserve_kwh"], soc),
-           "tomorrow": tomorrow, "terminal_ref_c": 19.5,
+           "tomorrow": tomorrow, "terminal_ref_c": cfg["comfort"].get("end_of_day_c", 19.5),
            "outdoor": data.series_fn(wx, "t", params.get("outdoor_bias_c", 0.0)),
            "radiation": data.series_fn(wx, "rad")}
     return ctx, [(t, v["t"]) for t, v in wx]
@@ -217,10 +217,11 @@ def build_plan(ha, cfg, params, now=None, wx=None):
     for name, vals in strat.items():
         results[name] = summary(vals, cur_offs, ev(vals, cur_offs))
     # 1) setpoints only (offset left where it is), 2) then setpoints and offsets together
-    sp_vals, _, _ = model.optimise(cfg, params, ctx, fixed, list(strat.values()), offsets=cur_offs, fixed_off=fixed_off)
+    passes = cfg.get("optimiser", {}).get("passes", 4)
+    sp_vals, _, _ = model.optimise(cfg, params, ctx, fixed, list(strat.values()), offsets=cur_offs, fixed_off=fixed_off, passes=passes)
     if use_off:
         best_vals, best_offs, _ = model.optimise(cfg, params, ctx, fixed, [sp_vals], offsets=cur_offs, fixed_off=fixed_off,
-                                                 tune_offsets=True, offset_cands=ocands)
+                                                 tune_offsets=True, offset_cands=ocands, passes=passes)
         results["Setpoints only (offset unchanged, for reference)"] = summary(sp_vals, cur_offs, ev(sp_vals, cur_offs))
     else:
         best_vals, best_offs = sp_vals, None
@@ -230,8 +231,10 @@ def build_plan(ha, cfg, params, now=None, wx=None):
     results["Optimised (no battery, for reference)"] = summary(best_vals, best_offs, nb)
     cur_trace = ev(current, cur_offs, trace=True)["trace"]
     chosen_name = "Optimised"
-    # stability rule: only deviate from the current routine if it saves at least 2p
-    if results["Current routine"]["total"] - results["Optimised"]["total"] < 0.02:
+    # stability rule: only move away from your routine if the optimised plan scores clearly better
+    rt = results["Current routine"]["total"]
+    gain = 100 * (rt - results["Optimised"]["total"]) / rt if rt > 0.1 else (rt - results["Optimised"]["total"]) * 100
+    if gain < cfg.get("optimiser", {}).get("min_gain_points", 0.5):
         chosen_name = "Current routine"
     # a day the owner edited in advance (week ahead) keeps their edit instead of being re-optimised
     pinned = load_overrides().get(tomorrow.isoformat())
@@ -314,7 +317,7 @@ def sim_context(cfg, plan):
     start = dt.datetime.fromisoformat(plan["start"])
     end = dt.datetime.combine(dt.date.fromisoformat(plan["for_date"]) + dt.timedelta(days=1), dt.time(4, 0))
     ctx = {"start_dt": start, "hours": (end - start).total_seconds() / 3600, "t_room0": plan["t_room0"],
-           "soc0_kwh": plan["soc0_kwh"], "tomorrow": dt.date.fromisoformat(plan["for_date"]), "terminal_ref_c": 19.5,
+           "soc0_kwh": plan["soc0_kwh"], "tomorrow": dt.date.fromisoformat(plan["for_date"]), "terminal_ref_c": cfg["comfort"].get("end_of_day_c", 19.5),
            "outdoor": data.series_fn(fc, None, params.get("outdoor_bias_c", 0.0))}
     fixed = [(b["from"], b["to"], b["temperature"]) for b in plan.get("fixed_today_tail", [])] or [(0, 24, 18.0)]
     return ctx, fixed, params, plan["strategies"]["Current routine"]["values"], None
@@ -505,7 +508,9 @@ def build_outlook(ha, cfg, params, wx, start, chosen_vals, cur_off=None, ocands=
         day = base + dt.timedelta(days=i)
         s_dt = dt.datetime.combine(day - dt.timedelta(days=1), dt.time(22, 0))
         try:
-            ctx, _ = make_ctx(ha, cfg, params, now=s_dt, wx=wx, room=19.8, soc=cfg["battery"]["reserve_kwh"] + 3)
+            ol = cfg.get("outlook") or {}
+            ctx, _ = make_ctx(ha, cfg, params, now=s_dt, wx=wx, room=ol.get("start_room_c", 19.8),
+                              soc=ol.get("start_battery_kwh", cfg["battery"]["reserve_kwh"] + 3))
             fixed = model.blocks_from_values(cfg, steady)
             fixed_off = model.blocks_from_values(cfg, offs0) if use_off else None
             vals, offs, _ = model.optimise(cfg, params, ctx, fixed, [steady], passes=3, offsets=offs0, fixed_off=fixed_off,
@@ -584,8 +589,10 @@ def outlook_ctx(cfg, plan, date_iso):
     day = dt.date.fromisoformat(date_iso)
     start = dt.datetime.combine(day - dt.timedelta(days=1), dt.time(22, 0))
     end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(4, 0))
-    ctx = {"start_dt": start, "hours": (end - start).total_seconds() / 3600, "t_room0": 19.8,
-           "soc0_kwh": cfg["battery"]["reserve_kwh"] + 3, "tomorrow": day, "terminal_ref_c": 19.5,
+    ol = cfg.get("outlook") or {}
+    ctx = {"start_dt": start, "hours": (end - start).total_seconds() / 3600, "t_room0": ol.get("start_room_c", 19.8),
+           "soc0_kwh": max(cfg["battery"]["reserve_kwh"], ol.get("start_battery_kwh", cfg["battery"]["reserve_kwh"] + 3)),
+           "tomorrow": day, "terminal_ref_c": cfg["comfort"].get("end_of_day_c", 19.5),
            "outdoor": data.series_fn(wx, "t", params.get("outdoor_bias_c", 0.0)), "radiation": data.series_fn(wx, "rad")}
     steady = [cfg["comfort"]["target_c"]] * len(cfg["blocks"])
     fixed = model.blocks_from_values(cfg, steady)
